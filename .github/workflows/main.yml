@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+
+# https://help.github.com/en/actions/automating-your-workflow-with-github-actions/software-installed-on-github-hosted-runners
+# GitHub Actions does not support Docker on Windows/macOS, so we use ikalnytskyi/action-setup-postgres there
+
+concurrency:
+  # On master/release, we don't want any jobs cancelled so the sha is used to name the group
+  # On PR branches, we cancel the job if new commits are pushed
+  # More info: https://stackoverflow.com/a/68422069/253468
+  group: ${{ (github.ref == 'refs/heads/master' || github.ref == 
+    'refs/heads/release' ) && format('ci-main-{0}', github.sha) || 
+    format('ci-main-{0}', github.ref) }}
+  cancel-in-progress: true
+
+jobs:
+  source-distribution-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: macos-latest
+          arch: arm64
+          runner: macos-latest
+          expander_leg: macos-latest--arm64
+    name: Source distribution [${{ matrix.expander_leg }}]
+    runs-on: ${{ matrix.runner }}
+    steps:
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803   # v6.1.0
+      with:
+        fetch-depth: 50
+    - name: Start PostgreSQL
+      if: ${{ runner.os == 'Linux' }}
+      working-directory: docker/postgres-server
+      shell: bash
+      run: docker compose up -d --wait || { docker compose logs; exit 1; }
+    # GitHub-hosted Windows/macOS runners cannot run the Linux PostgreSQL container,
+    # so provision a native PostgreSQL server there instead (same as build-test).
+    - name: Start PostgreSQL (non-Linux)
+      if: ${{ runner.os != 'Linux' }}
+      uses: 
+        ikalnytskyi/action-setup-postgres@c4dda34aae1c821e3a771b68b73b13af3198a7ee     # v8
+      with:
+        username: postgres
+        password: postgres
+        database: postgres
+      id: postgres
+    - name: Configure PostgreSQL (non-Linux)
+      if: ${{ runner.os != 'Linux' }}
+      shell: bash
+      # language=bash
+      run: |
+        PGDATA="$RUNNER_TEMP/pgdata"
+        PG_HBA="$PGDATA/pg_hba.conf"
+
+        # Use the same pg_hba.conf as the Docker-based setup.
+        # Remove 'local' lines (no unix sockets on Windows), disable hostssl lines
+        # (SSL is not enabled here) and add scram entry for PG 10+ auth tests.
+        cp certdir/server/pg_hba.conf "$PG_HBA"
+        sed -e '/^local/d' -e 's/^hostssl/#hostssl/' "$PG_HBA" > "$PG_HBA.tmp"
+        mv "$PG_HBA.tmp" "$PG_HBA"
+        echo "host    authtest        scram           all            scram-sha-256" >> "$PG_HBA"
+
+        psql -c "ALTER SYSTEM SET password_encryption = 'md5'"
+        psql -c "ALTER SYSTEM SET fsync = 'off'"
+        psql -c "ALTER SYSTEM SET synchronous_commit = 'off'"
+        psql -c "ALTER SYSTEM SET full_page_writes = 'off'"
+        pg_ctl restart -D "$PGDATA" -w
+
+        psql -c "CREATE USER test WITH PASSWORD 'test'"
+        psql -c "CREATE DATABASE test OWNER test"
+        psql -c "CREATE DATABASE test_2 OWNER test"
+        psql -c "CREATE EXTENSION hstore" -d test
+        psql -c "CREATE EXTENSION sslinfo" -d test
+      env:
+        PGSERVICE: ${{ steps.postgres.outputs.service-name }}
+    - name: 'Set up JDK 21'
+      uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961   # v5.7.0
+      with:
+        distribution: zulu
+        java-version: 21
+    - uses: 
+        burrunan/gradle-cache-action@404534c34a2faa40430357a3183522a845b04f3b       # v3.0.3
+      name: Prepare source distribution
+      env:
+        S3_BUILD_CACHE_ACCESS_KEY_ID: ${{ secrets.S3_BUILD_CACHE_ACCESS_KEY_ID 
+          }}
+        S3_BUILD_CACHE_SECRET_KEY: ${{ secrets.S3_BUILD_CACHE_SECRET_KEY }}
+      with:
+        job-id: source-release-jdk21
+        arguments: --scan --no-parallel --no-daemon sourceDistribution 
+          -Ppgjdbc.version=1.0 -Prelease -Psigning.pgp.enabled=OFF
+    - name: Verify source distribution
+      working-directory: pgjdbc/build/distributions
+      shell: bash
+        # language=bash
+      run: |
+        tar xzf postgresql-1.0-jdbc-src.tar.gz
+        cd postgresql-1.0-jdbc-src
+        if [ "$RUNNER_OS" != "Linux" ]; then
+          # The native server set up above uses a password for the superuser
+          cat <<EOF >>build.local.properties
+        privilegedUser=postgres
+        privilegedPassword=postgres
+        EOF
+        fi
+        mvn --batch-mode --fail-at-end --show-version verify
+    - name: Attach heap dump if any
+      if: ${{ failure() }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+      with:
+        name: pgjdbc-heapdump-source-distribution
+        path: 
+          pgjdbc/build/distributions/postgresql-1.0-jdbc-src/target/surefire-reports/*.hprof
+
+    timeout-minutes: 150
