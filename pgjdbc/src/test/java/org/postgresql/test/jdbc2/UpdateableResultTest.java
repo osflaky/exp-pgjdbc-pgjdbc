@@ -1,0 +1,1095 @@
+/*
+ * Copyright (c) 2001, PostgreSQL Global Development Group
+ * See the LICENSE file in the project root for more information.
+ */
+
+package org.postgresql.test.jdbc2;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+
+import org.postgresql.PGConnection;
+import org.postgresql.test.TestUtil;
+import org.postgresql.util.GT;
+
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.Isolated;
+
+import java.io.ByteArrayInputStream;
+import java.io.StringReader;
+import java.io.UnsupportedEncodingException;
+import java.sql.Array;
+import java.sql.Connection;
+import java.sql.Date;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.sql.Timestamp;
+import java.sql.Types;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
+import java.time.OffsetTime;
+import java.time.ZoneOffset;
+import java.util.TimeZone;
+
+@Isolated("Uses TimeZone.setDefault")
+public class UpdateableResultTest extends BaseTest4 {
+
+  @BeforeAll
+  static void createTables() throws Exception {
+    try (Connection con = TestUtil.openDB()) {
+      TestUtil.createTable(con, "updateable",
+          "id int primary key, name text, notselected text, ts timestamp with time zone, intarr int[]");
+      TestUtil.createTable(con, "hasdate", "id int primary key, dt date unique, name text");
+      TestUtil.createTable(con, "unique_null_constraint", "u1 int unique, name1 text");
+      TestUtil.createTable(con, "uniquekeys", "id int unique not null, id2 int unique, dt date");
+      TestUtil.createTable(con, "partialunique", "subject text, target text, success boolean");
+      TestUtil.execute(con, "CREATE UNIQUE INDEX tests_success_constraint ON partialunique (subject, target) WHERE success");
+      TestUtil.createTable(con, "second", "id1 int primary key, name1 text");
+      TestUtil.createTable(con, "primaryunique", "id int primary key, name text unique not null, dt date");
+      TestUtil.createTable(con, "serialtable", "gen_id serial primary key, name text");
+      TestUtil.createTable(con, "compositepktable", "gen_id serial, name text, dec_id serial");
+      TestUtil.execute(con, "alter sequence compositepktable_dec_id_seq increment by 10; alter sequence compositepktable_dec_id_seq restart with 10");
+      TestUtil.execute(con, "alter table compositepktable add primary key ( gen_id, dec_id )");
+      TestUtil.createTable(con, "stream", "id int primary key, asi text, chr text, bin bytea");
+      TestUtil.createTable(con, "multicol", "id1 int not null, id2 int not null, val text");
+      TestUtil.execute(con, "ALTER TABLE multicol ADD CONSTRAINT multicol_pk PRIMARY KEY (id1, id2)");
+      TestUtil.createTable(con, "nopkmulticol", "id1 int not null, id2 int not null, val text");
+      TestUtil.createTable(con, "booltable", "id int not null primary key, b boolean default false");
+      TestUtil.createTable(con, "datetimetable", "id int not null primary key, "
+          + "ttz timetz, tstz timestamptz, ts timestamp, d date, t time");
+    }
+  }
+
+  @AfterAll
+  static void dropTables() throws Exception {
+    try (Connection con = TestUtil.openDB()) {
+      TestUtil.dropTable(con, "updateable");
+      TestUtil.dropTable(con, "second");
+      TestUtil.dropTable(con, "serialtable");
+      TestUtil.dropTable(con, "compositepktable");
+      TestUtil.dropTable(con, "stream");
+      TestUtil.dropTable(con, "multicol");
+      TestUtil.dropTable(con, "nopkmulticol");
+      TestUtil.dropTable(con, "booltable");
+      TestUtil.dropTable(con, "datetimetable");
+      TestUtil.dropTable(con, "unique_null_constraint");
+      TestUtil.dropTable(con, "hasdate");
+      TestUtil.dropTable(con, "uniquekeys");
+      TestUtil.dropTable(con, "partialunique");
+      TestUtil.dropTable(con, "primaryunique");
+    }
+  }
+
+  @Override
+  public void setUp() throws Exception {
+    super.setUp();
+    TestUtil.execute(con, "TRUNCATE updateable CASCADE");
+    TestUtil.execute(con, "TRUNCATE hasdate CASCADE");
+    TestUtil.execute(con, "TRUNCATE unique_null_constraint");
+    TestUtil.execute(con, "TRUNCATE uniquekeys CASCADE");
+    TestUtil.execute(con, "TRUNCATE partialunique");
+    TestUtil.execute(con, "TRUNCATE second CASCADE");
+    TestUtil.execute(con, "TRUNCATE primaryunique CASCADE");
+    TestUtil.execute(con, "TRUNCATE serialtable CASCADE");
+    TestUtil.execute(con, "TRUNCATE compositepktable CASCADE");
+    TestUtil.execute(con, "ALTER SEQUENCE compositepktable_gen_id_seq RESTART WITH 1");
+    TestUtil.execute(con, "ALTER SEQUENCE compositepktable_dec_id_seq RESTART WITH 10");
+    TestUtil.execute(con, "TRUNCATE stream CASCADE");
+    TestUtil.execute(con, "TRUNCATE multicol CASCADE");
+    TestUtil.execute(con, "TRUNCATE nopkmulticol");
+    TestUtil.execute(con, "TRUNCATE booltable CASCADE");
+    TestUtil.execute(con, "TRUNCATE datetimetable");
+    TestUtil.execute(con, "ALTER SEQUENCE serialtable_gen_id_seq RESTART WITH 1");
+
+    TestUtil.execute(con, "insert into booltable (id) values (1)");
+    TestUtil.execute(con, "insert into datetimetable (id) values (1)");
+    TestUtil.execute(con, "insert into uniquekeys(id, id2, dt) values (1, 2, now())");
+    TestUtil.execute(con, "insert into second values (1,'anyvalue' )");
+    TestUtil.execute(con, "insert into unique_null_constraint values (1, 'dave')");
+    TestUtil.execute(con, "insert into unique_null_constraint values (null, 'unknown')");
+    TestUtil.execute(con, "insert into primaryunique values (1, 'dave', now())");
+  }
+
+  @Test
+  public void testDeleteRows() throws SQLException {
+    Statement st = con.createStatement();
+    st.executeUpdate("INSERT INTO second values (2,'two')");
+    st.executeUpdate("INSERT INTO second values (3,'three')");
+    st.executeUpdate("INSERT INTO second values (4,'four')");
+    st.close();
+
+    st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("select id1,name1 from second order by id1");
+
+    assertTrue(rs.next());
+    assertEquals(1, rs.getInt("id1"));
+    rs.deleteRow();
+    assertTrue(rs.isBeforeFirst());
+
+    assertTrue(rs.next());
+    assertTrue(rs.next());
+    assertEquals(3, rs.getInt("id1"));
+    rs.deleteRow();
+    assertEquals(2, rs.getInt("id1"));
+
+    rs.close();
+    st.close();
+  }
+
+  @Test
+  public void testCancelRowUpdates() throws Exception {
+    Statement st =
+        con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("select * from second");
+
+    // make sure we're dealing with the correct row.
+    rs.first();
+    assertEquals(1, rs.getInt(1));
+    assertEquals("anyvalue", rs.getString(2));
+
+    // update, cancel and make sure nothings changed.
+    rs.updateInt(1, 99);
+    rs.cancelRowUpdates();
+    assertEquals(1, rs.getInt(1));
+    assertEquals("anyvalue", rs.getString(2));
+
+    // real update
+    rs.updateInt(1, 999);
+    rs.updateRow();
+    assertEquals(999, rs.getInt(1));
+    assertEquals("anyvalue", rs.getString(2));
+
+    // scroll some and make sure the update is still there
+    rs.beforeFirst();
+    rs.next();
+    assertEquals(999, rs.getInt(1));
+    assertEquals("anyvalue", rs.getString(2));
+
+    // make sure the update got to the db and the driver isn't lying to us.
+    rs.close();
+    rs = st.executeQuery("select * from second");
+    rs.first();
+    assertEquals(999, rs.getInt(1));
+    assertEquals("anyvalue", rs.getString(2));
+
+    rs.close();
+    st.close();
+  }
+
+  private static void checkPositioning(ResultSet rs) throws SQLException {
+    try {
+      rs.getInt(1);
+      fail("Can't use an incorrectly positioned result set.");
+    } catch (SQLException sqle) {
+    }
+
+    try {
+      rs.updateInt(1, 2);
+      fail("Can't use an incorrectly positioned result set.");
+    } catch (SQLException sqle) {
+    }
+
+    try {
+      rs.updateRow();
+      fail("Can't use an incorrectly positioned result set.");
+    } catch (SQLException sqle) {
+    }
+
+    try {
+      rs.deleteRow();
+      fail("Can't use an incorrectly positioned result set.");
+    } catch (SQLException sqle) {
+    }
+  }
+
+  @Test
+  public void testPositioning() throws SQLException {
+    Statement stmt =
+        con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = stmt.executeQuery("SELECT id1,name1 FROM second");
+
+    checkPositioning(rs);
+
+    assertTrue(rs.next());
+    rs.beforeFirst();
+    checkPositioning(rs);
+
+    rs.afterLast();
+    checkPositioning(rs);
+
+    rs.beforeFirst();
+    assertTrue(rs.next());
+    assertTrue(!rs.next());
+    checkPositioning(rs);
+
+    rs.afterLast();
+    assertTrue(rs.previous());
+    assertTrue(!rs.previous());
+    checkPositioning(rs);
+
+    rs.close();
+    stmt.close();
+  }
+
+  @Test
+  public void testReturnSerial() throws Exception {
+    final String ole = "Ole";
+
+    Statement st = null;
+    ResultSet rs = null;
+    try {
+      st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+      rs = st.executeQuery("SELECT * FROM serialtable");
+
+      rs.moveToInsertRow();
+      rs.updateString("name", ole);
+      rs.insertRow();
+
+      assertTrue(rs.first());
+      assertEquals(1, rs.getInt("gen_id"));
+      assertEquals(ole, rs.getString("name"));
+
+    } finally {
+      TestUtil.closeQuietly(rs);
+      TestUtil.closeQuietly(st);
+    }
+
+    final String ole2 = "OleOle";
+    try {
+      st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+      rs = st.executeQuery("SELECT name, gen_id FROM serialtable");
+
+      rs.moveToInsertRow();
+      rs.updateString("name", ole2);
+      rs.insertRow();
+
+      assertTrue(rs.first());
+      assertEquals(1, rs.getInt("gen_id"));
+      assertEquals(ole, rs.getString("name"));
+
+      assertTrue(rs.last());
+      assertEquals(2, rs.getInt("gen_id"));
+      assertEquals(ole2, rs.getString("name"));
+
+    } finally {
+      TestUtil.closeQuietly(rs);
+      TestUtil.closeQuietly(st);
+    }
+
+    final String dec = "Dec";
+    try {
+      st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+      rs = st.executeQuery("SELECT * FROM compositepktable");
+
+      rs.moveToInsertRow();
+      rs.updateString("name", dec);
+      rs.insertRow();
+
+      assertTrue(rs.first());
+      assertEquals(1, rs.getInt("gen_id"));
+      assertEquals(dec, rs.getString("name"));
+      assertEquals(10, rs.getInt("dec_id"));
+
+      rs.moveToInsertRow();
+      rs.updateString("name", dec);
+      rs.insertRow();
+
+      assertTrue(rs.last());
+      assertEquals(2, rs.getInt("gen_id"));
+      assertEquals(dec, rs.getString("name"));
+      assertEquals(20, rs.getInt("dec_id"));
+
+    } finally {
+      TestUtil.closeQuietly(rs);
+      TestUtil.closeQuietly(st);
+    }
+  }
+
+  @Test
+  public void testUpdateTimestamp() throws SQLException {
+    TimeZone origTZ = TimeZone.getDefault();
+    try {
+      // We choose a timezone which has a partial hour portion
+      // Asia/Tehran is +3:30
+      TimeZone.setDefault(TimeZone.getTimeZone("Asia/Tehran"));
+      Timestamp ts = Timestamp.valueOf("2006-11-20 16:17:18");
+
+      Statement stmt =
+          con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+      ResultSet rs = stmt.executeQuery("SELECT id, ts FROM updateable");
+      rs.moveToInsertRow();
+      rs.updateInt(1, 1);
+      rs.updateTimestamp(2, ts);
+      rs.insertRow();
+      rs.first();
+      assertEquals(ts, rs.getTimestamp(2));
+    } finally {
+      TimeZone.setDefault(origTZ);
+    }
+  }
+
+  @Test
+  public void testUpdateStreams() throws SQLException, UnsupportedEncodingException {
+    String string = "Hello";
+    byte[] bytes = new byte[]{0, '\\', (byte) 128, (byte) 255};
+
+    Statement stmt =
+        con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = stmt.executeQuery("SELECT id, asi, chr, bin FROM stream");
+
+    rs.moveToInsertRow();
+    rs.updateInt(1, 1);
+    rs.updateAsciiStream("asi", null, 17);
+    rs.updateCharacterStream("chr", null, 81);
+    rs.updateBinaryStream("bin", null, 0);
+    rs.insertRow();
+
+    rs.moveToInsertRow();
+    rs.updateInt(1, 3);
+    rs.updateAsciiStream("asi", new ByteArrayInputStream(string.getBytes("US-ASCII")), 5);
+    rs.updateCharacterStream("chr", new StringReader(string), 5);
+    rs.updateBinaryStream("bin", new ByteArrayInputStream(bytes), bytes.length);
+    rs.insertRow();
+
+    rs.beforeFirst();
+    rs.next();
+
+    assertEquals(1, rs.getInt(1));
+    assertNull(rs.getString(2));
+    assertNull(rs.getString(3));
+    assertNull(rs.getBytes(4));
+
+    rs.updateInt("id", 2);
+    rs.updateAsciiStream("asi", new ByteArrayInputStream(string.getBytes("US-ASCII")), 5);
+    rs.updateCharacterStream("chr", new StringReader(string), 5);
+    rs.updateBinaryStream("bin", new ByteArrayInputStream(bytes), bytes.length);
+    rs.updateRow();
+
+    assertEquals(2, rs.getInt(1));
+    assertEquals(string, rs.getString(2));
+    assertEquals(string, rs.getString(3));
+    assertArrayEquals(bytes, rs.getBytes(4));
+
+    rs.refreshRow();
+
+    assertEquals(2, rs.getInt(1));
+    assertEquals(string, rs.getString(2));
+    assertEquals(string, rs.getString(3));
+    assertArrayEquals(bytes, rs.getBytes(4));
+
+    rs.next();
+
+    assertEquals(3, rs.getInt(1));
+    assertEquals(string, rs.getString(2));
+    assertEquals(string, rs.getString(3));
+    assertArrayEquals(bytes, rs.getBytes(4));
+
+    rs.close();
+    stmt.close();
+  }
+
+  @Test
+  public void testZeroRowResult() throws SQLException {
+    Statement st =
+        con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("select * from updateable WHERE 0 > 1");
+    assertTrue(!rs.next());
+    rs.moveToInsertRow();
+    rs.moveToCurrentRow();
+  }
+
+  @Test
+  public void testUpdateable() throws SQLException {
+    Statement st =
+        con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("select * from updateable");
+    assertNotNull(rs);
+    rs.moveToInsertRow();
+    rs.updateInt(1, 1);
+    rs.updateString(2, "jake");
+    rs.updateString(3, "avalue");
+    rs.insertRow();
+    rs.first();
+
+    rs.updateInt("id", 2);
+    rs.updateString("name", "dave");
+    rs.updateRow();
+
+    assertEquals(2, rs.getInt("id"));
+    assertEquals("dave", rs.getString("name"));
+    assertEquals("avalue", rs.getString("notselected"));
+
+    rs.deleteRow();
+    rs.moveToInsertRow();
+    rs.updateInt("id", 3);
+    rs.updateString("name", "paul");
+
+    rs.insertRow();
+
+    try {
+      rs.refreshRow();
+      fail("Can't refresh when on the insert row.");
+    } catch (SQLException sqle) {
+    }
+
+    assertEquals(3, rs.getInt("id"));
+    assertEquals("paul", rs.getString("name"));
+    assertNull(rs.getString("notselected"));
+
+    rs.close();
+
+    rs = st.executeQuery("select id1, id, name, name1 from updateable, second");
+    try {
+      while (rs.next()) {
+        rs.updateInt("id", 2);
+        rs.updateString("name", "dave");
+        rs.updateRow();
+      }
+      fail("should not get here, update should fail");
+    } catch (SQLException ex) {
+    }
+
+    rs = st.executeQuery("select * from updateable");
+    assertTrue(rs.first());
+    rs.updateInt("id", 3);
+    rs.updateString("name", "dave3");
+    rs.updateRow();
+    assertEquals(3, rs.getInt("id"));
+    assertEquals("dave3", rs.getString("name"));
+
+    rs.moveToInsertRow();
+    rs.updateInt("id", 4);
+    rs.updateString("name", "dave4");
+
+    rs.insertRow();
+    rs.updateInt("id", 5);
+    rs.updateString("name", "dave5");
+    rs.insertRow();
+
+    rs.moveToCurrentRow();
+    assertEquals(3, rs.getInt("id"));
+    assertEquals("dave3", rs.getString("name"));
+
+    assertTrue(rs.next());
+    assertEquals(4, rs.getInt("id"));
+    assertEquals("dave4", rs.getString("name"));
+
+    assertTrue(rs.next());
+    assertEquals(5, rs.getInt("id"));
+    assertEquals("dave5", rs.getString("name"));
+
+    rs.close();
+    st.close();
+  }
+
+  @Test
+  public void testUpdateDate() throws Exception {
+    Date testDate = Date.valueOf("2021-01-01");
+    TestUtil.execute(con, "insert into hasdate values (1,'2021-01-01'::date)");
+    con.setAutoCommit(false);
+    String sql = "SELECT * FROM hasdate where id=1";
+    ResultSet rs = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
+        ResultSet.CONCUR_UPDATABLE).executeQuery(sql);
+    assertTrue(rs.next());
+    assertEquals(testDate, rs.getDate("dt"));
+    rs.updateDate("dt", Date.valueOf("2020-01-01"));
+    rs.updateRow();
+    assertEquals(Date.valueOf("2020-01-01"), rs.getDate("dt"));
+    con.commit();
+    rs = con.createStatement().executeQuery("select dt from hasdate where id=1");
+    assertTrue(rs.next());
+    assertEquals(Date.valueOf("2020-01-01"), rs.getDate("dt"));
+    rs.close();
+  }
+
+  @Test
+  public void test2193() throws Exception {
+    Statement st =
+        con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("select * from updateable");
+    assertNotNull(rs);
+    rs.moveToInsertRow();
+    rs.updateInt(1, 1);
+    rs.updateString(2, "jake");
+    rs.updateString(3, "avalue");
+    rs.insertRow();
+    rs.first();
+
+    rs.updateString(2, "bob");
+    rs.updateRow();
+    rs.refreshRow();
+    rs.updateString(2, "jake");
+    rs.updateRow();
+  }
+
+  @Test
+  public void testInsertRowIllegalMethods() throws Exception {
+    Statement st =
+        con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("select * from updateable");
+    assertNotNull(rs);
+    rs.moveToInsertRow();
+
+    try {
+      rs.cancelRowUpdates();
+      fail("expected an exception when calling cancelRowUpdates() on the insert row");
+    } catch (SQLException e) {
+    }
+
+    try {
+      rs.updateRow();
+      fail("expected an exception when calling updateRow() on the insert row");
+    } catch (SQLException e) {
+    }
+
+    try {
+      rs.deleteRow();
+      fail("expected an exception when calling deleteRow() on the insert row");
+    } catch (SQLException e) {
+    }
+
+    try {
+      rs.refreshRow();
+      fail("expected an exception when calling refreshRow() on the insert row");
+    } catch (SQLException e) {
+    }
+
+    rs.close();
+    st.close();
+  }
+
+  @Test
+  public void testUpdateablePreparedStatement() throws Exception {
+    // No args.
+    PreparedStatement st = con.prepareStatement("select * from updateable",
+        ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery();
+    rs.moveToInsertRow();
+    rs.close();
+    st.close();
+
+    // With args.
+    st = con.prepareStatement("select * from updateable where id = ?",
+        ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    st.setInt(1, 1);
+    rs = st.executeQuery();
+    rs.moveToInsertRow();
+    rs.close();
+    st.close();
+  }
+
+  @Test
+  public void testUpdateSelectOnly() throws Exception {
+    Statement st =
+        con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+
+    ResultSet rs = st.executeQuery("select * from only second");
+    assertTrue(rs.next());
+    rs.updateInt(1, 2);
+    rs.updateRow();
+  }
+
+  @Test
+  public void testUpdateReadOnlyResultSet() throws Exception {
+    Statement st =
+        con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
+    ResultSet rs = st.executeQuery("select * from updateable");
+    try {
+      rs.moveToInsertRow();
+      fail("expected an exception when calling moveToInsertRow() on a read-only resultset");
+    } catch (SQLException e) {
+    }
+  }
+
+  @Test
+  public void testBadColumnIndexes() throws Exception {
+    Statement st =
+        con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("select * from updateable");
+    rs.moveToInsertRow();
+    try {
+      rs.updateInt(0, 1);
+      fail("Should have thrown an exception on bad column index.");
+    } catch (SQLException sqle) {
+    }
+    try {
+      rs.updateString(1000, "hi");
+      fail("Should have thrown an exception on bad column index.");
+    } catch (SQLException sqle) {
+    }
+    try {
+      rs.updateNull(1000);
+      fail("Should have thrown an exception on bad column index.");
+    } catch (SQLException sqle) {
+    }
+  }
+
+  @Test
+  public void testArray() throws SQLException {
+    Statement stmt =
+        con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    stmt.executeUpdate("INSERT INTO updateable (id, intarr) VALUES (1, '{1,2,3}'::int4[])");
+    ResultSet rs = stmt.executeQuery("SELECT id, intarr FROM updateable");
+    assertTrue(rs.next());
+    rs.updateObject(2, rs.getArray(2));
+    rs.updateRow();
+
+    Array arr = rs.getArray(2);
+    assertEquals(Types.INTEGER, arr.getBaseType());
+    Integer[] intarr = (Integer[]) arr.getArray();
+    assertEquals(3, intarr.length);
+    assertEquals(1, intarr[0].intValue());
+    assertEquals(2, intarr[1].intValue());
+    assertEquals(3, intarr[2].intValue());
+    rs.close();
+
+    rs = stmt.executeQuery("SELECT id,intarr FROM updateable");
+    assertTrue(rs.next());
+    arr = rs.getArray(2);
+    assertEquals(Types.INTEGER, arr.getBaseType());
+    intarr = (Integer[]) arr.getArray();
+    assertEquals(3, intarr.length);
+    assertEquals(1, intarr[0].intValue());
+    assertEquals(2, intarr[1].intValue());
+    assertEquals(3, intarr[2].intValue());
+
+    rs.close();
+    stmt.close();
+  }
+
+  @Test
+  public void testMultiColumnUpdateWithoutAllColumns() throws Exception {
+    Statement st =
+        con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("select id1,val from multicol");
+    try {
+      rs.moveToInsertRow();
+      fail("Move to insert row succeeded. It should not");
+    } catch (SQLException sqle) {
+      // Ensure we're reporting that the RS is not updatable.
+      assertEquals("24000", sqle.getSQLState());
+    } finally {
+      TestUtil.closeQuietly(rs);
+      TestUtil.closeQuietly(st);
+    }
+  }
+
+  @Test
+  public void testMultiColumnUpdateWithoutPrimaryKey() throws Exception {
+    Statement st =
+        con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("select * from nopkmulticol");
+    try {
+      rs.moveToInsertRow();
+      fail("Move to insert row succeeded. It should not");
+    } catch (SQLException sqle) {
+      // Ensure we're reporting that the RS is not updatable.
+      assertEquals("24000", sqle.getSQLState());
+    } finally {
+      TestUtil.closeQuietly(rs);
+      TestUtil.closeQuietly(st);
+    }
+  }
+
+  @Test
+  public void testMultiColumnUpdate() throws Exception {
+    Statement st =
+        con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_UPDATABLE);
+    st.executeUpdate("INSERT INTO multicol (id1,id2,val) VALUES (1,2,'val')");
+
+    ResultSet rs = st.executeQuery("SELECT id1, id2, val FROM multicol");
+    assertTrue(rs.next());
+    assertEquals("val", rs.getString("val"));
+    rs.updateString("val", "newval");
+    rs.updateRow();
+    rs.close();
+
+    rs = st.executeQuery("SELECT id1, id2, val FROM multicol");
+    assertTrue(rs.next());
+    assertEquals("newval", rs.getString("val"));
+    rs.close();
+    st.close();
+  }
+
+  @Test
+  public void simpleAndUpdateableSameQuery() throws Exception {
+    PGConnection unwrap = con.unwrap(PGConnection.class);
+    assumeTrue(unwrap != null, "con.unwrap(PGConnection.class) should not be null");
+    int prepareThreshold = unwrap.getPrepareThreshold();
+    String sql = "select * from second where id1=?";
+    for (int i = 0; i <= prepareThreshold; i++) {
+      PreparedStatement ps = null;
+      ResultSet rs = null;
+      try {
+        ps = con.prepareStatement(sql);
+        ps.setInt(1, 1);
+        rs = ps.executeQuery();
+        rs.next();
+        String name1 = rs.getString("name1");
+        assertEquals("anyvalue", name1);
+        int id1 = rs.getInt("id1");
+        assertEquals(1, id1);
+      } finally {
+        TestUtil.closeQuietly(rs);
+        TestUtil.closeQuietly(ps);
+      }
+    }
+    // The same SQL, and use updateable ResultSet
+    {
+      PreparedStatement ps = null;
+      ResultSet rs = null;
+      try {
+        ps = con.prepareStatement(sql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_UPDATABLE);
+        ps.setInt(1, 1);
+        rs = ps.executeQuery();
+        rs.next();
+        String name1 = rs.getString("name1");
+        assertEquals("anyvalue", name1);
+        int id1 = rs.getInt("id1");
+        assertEquals(1, id1);
+        rs.updateString("name1", "updatedValue");
+        rs.updateRow();
+      } finally {
+        TestUtil.closeQuietly(rs);
+        TestUtil.closeQuietly(ps);
+      }
+    }
+  }
+
+  @Test
+  public void testUpdateBoolean() throws Exception {
+
+    Statement st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
+        ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("SELECT * FROM booltable WHERE id=1");
+    assertTrue(rs.next());
+    assertFalse(rs.getBoolean("b"));
+    rs.updateBoolean("b", true);
+    rs.updateRow();
+    //rs.refreshRow(); //fetches the value stored
+    assertTrue(rs.getBoolean("b"));
+  }
+
+  @Test
+  public void testOidUpdatable() throws Exception {
+    try (Connection privilegedCon = TestUtil.openPrivilegedDB()) {
+      Statement st = privilegedCon.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
+          ResultSet.CONCUR_UPDATABLE);
+      ResultSet rs = st.executeQuery("SELECT oid,* FROM pg_class WHERE relname = 'pg_class'");
+      assertTrue(rs.next());
+      assertTrue(rs.first());
+      rs.updateString("relname", "pg_class");
+      rs.updateRow();
+      rs.close();
+      st.close();
+    }
+  }
+
+  @Test
+  public void testUniqueWithNullableColumnsNotUpdatable() throws Exception {
+    Statement st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
+        ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("SELECT u1, name1 from unique_null_constraint");
+    assertTrue(rs.next());
+    assertTrue(rs.first());
+    try {
+      rs.updateString("name1", "bob");
+      fail("Should have failed since unique column u1 is nullable");
+    } catch (SQLException ex) {
+      assertEquals(
+          GT.tr("No eligible primary or unique key found for table {0}.", "unique_null_constraint"),
+          ex.getMessage());
+    }
+    rs.close();
+    st.close();
+  }
+
+  @Test
+  public void testPrimaryAndUniqueUpdateableByPrimary() throws Exception {
+    Statement st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
+        ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("SELECT id, dt from primaryunique");
+    assertTrue(rs.next());
+    assertTrue(rs.first());
+    int id = rs.getInt("id");
+    rs.updateDate("dt", Date.valueOf("1999-01-01"));
+    rs.updateRow();
+    assertFalse(rs.next());
+    rs.close();
+    rs = st.executeQuery("select dt from primaryunique where id = " + id);
+    assertTrue(rs.next());
+    assertEquals(Date.valueOf("1999-01-01"), rs.getDate("dt"));
+    rs.close();
+    st.close();
+  }
+
+  @Test
+  public void testPrimaryAndUniqueUpdateableByUnique() throws Exception {
+    Statement st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
+        ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("SELECT name, dt from primaryunique");
+    assertTrue(rs.next());
+    assertTrue(rs.first());
+    String name = rs.getString("name");
+    rs.updateDate("dt", Date.valueOf("1999-01-01"));
+    rs.updateRow();
+    assertFalse(rs.next());
+    rs.close();
+    rs = st.executeQuery("select dt from primaryunique where name = '" + name + "'");
+    assertTrue(rs.next());
+    assertEquals(Date.valueOf("1999-01-01"), rs.getDate("dt"));
+    rs.close();
+    st.close();
+  }
+
+  @Test
+  public void testUniqueWithNullAndNotNullableColumnUpdateable() throws Exception {
+    Statement st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
+        ResultSet.CONCUR_UPDATABLE);
+    int id = 0;
+    int id2 = 0;
+    ResultSet rs = st.executeQuery("SELECT id, id2, dt from uniquekeys");
+    assertTrue(rs.next());
+    assertTrue(rs.first());
+    id = rs.getInt("id");
+    id2 = rs.getInt("id2");
+    rs.updateDate("dt", Date.valueOf("1999-01-01"));
+    rs.updateRow();
+    rs.close();
+    rs = st.executeQuery("select dt from uniquekeys where id = " + id + " and id2 = " + id2);
+    assertNotNull(rs);
+    assertTrue(rs.next());
+    assertEquals(Date.valueOf("1999-01-01"), rs.getDate("dt"));
+    rs.close();
+    st.close();
+  }
+
+  @Test
+  public void testUniqueWithNotNullableColumnUpdateable() throws Exception {
+    Statement st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
+        ResultSet.CONCUR_UPDATABLE);
+    int id = 0;
+    ResultSet rs = st.executeQuery("SELECT id, dt from uniquekeys");
+    assertTrue(rs.next());
+    assertTrue(rs.first());
+    id = rs.getInt("id");
+    rs.updateDate("dt", Date.valueOf("1999-01-01"));
+    rs.updateRow();
+    rs.close();
+    rs = st.executeQuery("select id, dt from uniquekeys where id = " + id);
+    assertNotNull(rs);
+    assertTrue(rs.next());
+    assertEquals(Date.valueOf("1999-01-01"), rs.getDate("dt"));
+    rs.close();
+    st.close();
+  }
+
+  @Test
+  public void testUniqueWithNullableColumnNotUpdateable() throws Exception {
+    Statement st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
+        ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("SELECT id2, dt from uniquekeys");
+    assertTrue(rs.next());
+    assertTrue(rs.first());
+    try {
+      rs.updateDate("dt", Date.valueOf("1999-01-01"));
+      fail("Should have failed since id2 is nullable column");
+    } catch (SQLException ex) {
+      assertEquals(
+          GT.tr("No eligible primary or unique key found for table {0}.", "uniquekeys"),
+          ex.getMessage());
+    }
+    rs.close();
+    st.close();
+  }
+
+  @Test
+  public void testNoUniqueNotUpdateable() throws SQLException {
+    Statement st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
+        ResultSet.CONCUR_UPDATABLE);
+    ResultSet rs = st.executeQuery("SELECT dt from uniquekeys");
+    assertTrue(rs.next());
+    assertTrue(rs.first());
+    try {
+      rs.updateDate("dt", Date.valueOf("1999-01-01"));
+      fail("Should have failed since no UK/PK are in the select statement");
+    } catch (SQLException ex) {
+      assertEquals(
+          GT.tr("No eligible primary or unique key found for table {0}.", "uniquekeys"),
+          ex.getMessage());
+    }
+    rs.close();
+    st.close();
+  }
+
+  /*
+   * Updating an updatable ResultSet with java.time values used to throw a ClassCastException while
+   * refreshing the in-memory row buffer, even though the UPDATE itself succeeded.
+   * See https://github.com/pgjdbc/pgjdbc/issues/3464
+   */
+
+  @Test
+  public void testUpdateRowWithOffsetTime() throws SQLException {
+    OffsetTime value = OffsetTime.of(LocalTime.of(12, 34, 56, 123_456_000), ZoneOffset.ofHours(-8));
+    OffsetTime fromDb = updateRowAndReselect("ttz", value, OffsetTime.class);
+    // timetz keeps the offset, but a binary fetch may re-express it in the session time zone,
+    // so compare the instant rather than the textual offset
+    assertTrue(value.isEqual(fromDb), "expected " + value + " to equal " + fromDb);
+  }
+
+  @Test
+  public void testUpdateRowWithOffsetDateTime() throws SQLException {
+    OffsetDateTime value =
+        OffsetDateTime.of(LocalDateTime.of(2024, 1, 31, 12, 34, 56, 123_456_000), ZoneOffset.ofHours(5));
+    OffsetDateTime fromDb = updateRowAndReselect("tstz", value, OffsetDateTime.class);
+    // timestamptz is stored as an instant and returned in the session time zone
+    assertTrue(value.isEqual(fromDb), "expected " + value + " to equal " + fromDb);
+  }
+
+  @Test
+  public void testUpdateRowWithLocalDateTime() throws SQLException {
+    LocalDateTime value = LocalDateTime.of(2024, 1, 31, 12, 34, 56, 123_456_000);
+    assertEquals(value, updateRowAndReselect("ts", value, LocalDateTime.class));
+  }
+
+  @Test
+  public void testUpdateRowWithLocalDate() throws SQLException {
+    LocalDate value = LocalDate.of(2024, 1, 31);
+    assertEquals(value, updateRowAndReselect("d", value, LocalDate.class));
+  }
+
+  @Test
+  public void testUpdateRowWithLocalTime() throws SQLException {
+    LocalTime value = LocalTime.of(12, 34, 56, 123_456_000);
+    assertEquals(value, updateRowAndReselect("t", value, LocalTime.class));
+  }
+
+  @Test
+  public void testInsertRowWithJavaTimeValues() throws SQLException {
+    OffsetTime ttz = OffsetTime.of(LocalTime.of(1, 2, 3, 456_000_000), ZoneOffset.ofHours(-8));
+    OffsetDateTime tstz =
+        OffsetDateTime.of(LocalDateTime.of(2024, 6, 1, 1, 2, 3, 456_000_000), ZoneOffset.ofHours(5));
+    LocalDateTime ts = LocalDateTime.of(2024, 6, 1, 1, 2, 3, 456_000_000);
+    LocalDate d = LocalDate.of(2024, 6, 1);
+    LocalTime t = LocalTime.of(1, 2, 3, 456_000_000);
+
+    try (Statement st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
+        ResultSet.CONCUR_UPDATABLE);
+        ResultSet rs = st.executeQuery("SELECT id, ttz, tstz, ts, d, t FROM datetimetable")) {
+      rs.moveToInsertRow();
+      rs.updateInt("id", 2);
+      rs.updateObject("ttz", ttz);
+      rs.updateObject("tstz", tstz);
+      rs.updateObject("ts", ts);
+      rs.updateObject("d", d);
+      rs.updateObject("t", t);
+      // insertRow() refreshes the same row buffer as updateRow(), so it shared the bug
+      rs.insertRow();
+    }
+
+    try (Statement st = con.createStatement();
+        ResultSet rs = st.executeQuery("SELECT ttz, tstz, ts, d, t FROM datetimetable WHERE id = 2")) {
+      assertTrue(rs.next());
+      OffsetTime ttzFromDb = rs.getObject(1, OffsetTime.class);
+      OffsetDateTime tstzFromDb = rs.getObject(2, OffsetDateTime.class);
+      assertNotNull(ttzFromDb);
+      assertNotNull(tstzFromDb);
+      assertTrue(ttz.isEqual(ttzFromDb), "expected " + ttz + " to equal " + ttzFromDb);
+      assertTrue(tstz.isEqual(tstzFromDb), "expected " + tstz + " to equal " + tstzFromDb);
+      assertEquals(ts, rs.getObject(3, LocalDateTime.class));
+      assertEquals(d, rs.getObject(4, LocalDate.class));
+      assertEquals(t, rs.getObject(5, LocalTime.class));
+    }
+  }
+
+  /**
+   * Updates {@code column} of the seeded {@code datetimetable} row through an updatable
+   * {@link ResultSet} and reads the value back with a fresh query to confirm it reached the
+   * database.
+   */
+  private <T> T updateRowAndReselect(String column, T value, Class<T> type) throws SQLException {
+    try (Statement st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
+        ResultSet.CONCUR_UPDATABLE);
+        ResultSet rs =
+            st.executeQuery("SELECT id, " + column + " FROM datetimetable WHERE id = 1")) {
+      assertTrue(rs.next(), "datetimetable must contain the seeded row with id = 1");
+      rs.updateObject(column, value);
+      // Before the fix this threw ClassCastException while refreshing the row buffer
+      rs.updateRow();
+      // The freshly written row buffer must be parseable back into the same type
+      assertNotNull(rs.getObject(column, type), "row buffer value must not be null after updateRow()");
+    }
+    try (Statement st = con.createStatement();
+        ResultSet rs =
+            st.executeQuery("SELECT " + column + " FROM datetimetable WHERE id = 1")) {
+      assertTrue(rs.next());
+      T fromDb = rs.getObject(1, type);
+      assertNotNull(fromDb);
+      return fromDb;
+    }
+  }
+
+  @Test
+  public void testUpdateableWithSameTableNameInMultipleSchemas() throws SQLException {
+    // Two schemas hold a table with the same name and the same auto-generated primary key
+    // index name (same_name_pkey), but a different set of key columns. An unqualified query
+    // must be classified using only the table visible through search_path, not the union of
+    // both schemas' key columns. Before the fix the union made upd_schema_a's single-column
+    // key look incomplete, so the result set was wrongly rejected as not updatable.
+    //
+    // search_path puts an empty schema first, so the table resolves through a later entry
+    // (upd_schema_a). This also rules out the rejected #3400 approach of defaulting the
+    // schema to current_schema(): current_schema() is the empty schema, which holds no
+    // same_name table, so that approach would still reject the result set.
+    TestUtil.execute(con, "DROP SCHEMA IF EXISTS upd_schema_empty CASCADE");
+    TestUtil.execute(con, "DROP SCHEMA IF EXISTS upd_schema_a CASCADE");
+    TestUtil.execute(con, "DROP SCHEMA IF EXISTS upd_schema_b CASCADE");
+    TestUtil.execute(con, "CREATE SCHEMA upd_schema_empty");
+    TestUtil.execute(con, "CREATE SCHEMA upd_schema_a");
+    TestUtil.execute(con, "CREATE SCHEMA upd_schema_b");
+    String savedSearchPath;
+    try (Statement show = con.createStatement();
+         ResultSet rs = show.executeQuery("SHOW search_path")) {
+      assertTrue(rs.next());
+      String sp = rs.getString(1);
+      savedSearchPath = sp != null ? sp : "\"$user\", public";
+    }
+    try {
+      TestUtil.execute(con, "CREATE TABLE upd_schema_a.same_name (id int PRIMARY KEY, val text)");
+      TestUtil.execute(con,
+          "CREATE TABLE upd_schema_b.same_name (id int, other int, val text, PRIMARY KEY (id, other))");
+      TestUtil.execute(con, "INSERT INTO upd_schema_a.same_name (id, val) VALUES (1, 'a')");
+
+      TestUtil.execute(con, "SET search_path TO upd_schema_empty, upd_schema_a, upd_schema_b");
+      try (Statement st = con.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
+          ResultSet.CONCUR_UPDATABLE)) {
+        try (ResultSet rs = st.executeQuery("SELECT id, val FROM same_name")) {
+          assertTrue(rs.next());
+          rs.updateString("val", "updated");
+          rs.updateRow();
+        }
+        try (ResultSet rs = st.executeQuery("SELECT val FROM same_name WHERE id = 1")) {
+          assertTrue(rs.next());
+          assertEquals("updated", rs.getString("val"));
+        }
+      }
+    } finally {
+      TestUtil.execute(con, "SET search_path TO " + savedSearchPath);
+      TestUtil.execute(con, "DROP SCHEMA IF EXISTS upd_schema_empty CASCADE");
+      TestUtil.execute(con, "DROP SCHEMA IF EXISTS upd_schema_a CASCADE");
+      TestUtil.execute(con, "DROP SCHEMA IF EXISTS upd_schema_b CASCADE");
+    }
+  }
+}

@@ -1,0 +1,1211 @@
+# Changelog
+Notable changes since version 42.0.0, read the complete [History of Changes](https://jdbc.postgresql.org/documentation/changelog.html).
+
+The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
+## [Unreleased]
+
+### Fixed
+* fix: `PGStream.skip` no longer loops forever when the connection ends while the driver is discarding bytes, and no longer mistakes a stream that skips nothing for one that has ended. `InputStream.skip` may return zero with more data still coming, which a stream supplied through the `socketFactory` property is free to do; the driver now reads a byte in that case and treats only `-1` as the end [PR #4358](https://github.com/pgjdbc/pgjdbc/pull/4358)
+* fix: `LargeObjectManager` operations now work inside an active XA transaction. Since 42.7.13 an XA branch keeps the caller's `autoCommit=true`, and the guard rejected large objects as if the connection were idle. It now checks the server transaction state (`getTransactionState()`) instead of `autoCommit`, so a genuine auto-commit connection with no open transaction is still refused [Issue #4309](https://github.com/pgjdbc/pgjdbc/issues/4309) [PR #4310](https://github.com/pgjdbc/pgjdbc/pull/4310)
+* fix: batch update counts are no longer secured as committed inside an XA transaction. `BatchResultHandler` treated per-statement progress as durable whenever `autoCommit=true`, but an XA branch keeps `autoCommit=true` while the transaction is open, so a batch that flushed mid-way and then failed could report rolled-back statements as succeeded. Progress is now secured only when no server transaction is open [Issue #4309](https://github.com/pgjdbc/pgjdbc/issues/4309) [PR #4311](https://github.com/pgjdbc/pgjdbc/pull/4311)
+
+### Changed
+* fix: backend message lengths are checked before anything is sized from them. Each length is checked against the message layout and a limit for its type, the lengths inside `DataRow` and `FunctionCallResponse` are checked against the message, and the `NegotiateProtocolVersion` option count is bounded. A hostile or out of sync backend could previously force an allocation of up to two gigabytes with a five byte header [Issue #4015](https://github.com/pgjdbc/pgjdbc/issues/4015)
+* fix: the read buffer is limited to 32 MiB and grows once per request rather than once per socket read. It previously doubled on every read while a large request was outstanding, so a peer that declared a large length and sent it slowly grew the buffer until the doubling past 1 GiB overflowed to a negative size [Issue #4015](https://github.com/pgjdbc/pgjdbc/issues/4015)
+* fix: a zero-length `CopyData` body is accepted. It is valid on the wire and was previously rejected by an assertion, so it failed only on JVMs started with `-ea` [Issue #4015](https://github.com/pgjdbc/pgjdbc/issues/4015)
+* fix: GSS packet lengths are bounded. The encrypted transport is limited to a 16380 byte payload and the handshake to a 65532 byte token, matching `PQ_GSS_MAX_PACKET_SIZE` and `PQ_GSS_AUTH_BUFFER_SIZE` [Issue #4015](https://github.com/pgjdbc/pgjdbc/issues/4015)
+* fix: a connection whose stream has been refused is no longer reusable. Any refused length or count marks the stream broken, so `Connection.isClosed()` reports it closed and a pool that tests on borrow discards it. The socket is dropped with `SO_LINGER 0` [Issue #4015](https://github.com/pgjdbc/pgjdbc/issues/4015)
+* fix: a protocol violation before authentication is reported as `PSQLException` with SQLState `08P01` rather than as a plain I/O error, and is no longer retried under `sslMode=allow` or `sslMode=prefer` [Issue #4015](https://github.com/pgjdbc/pgjdbc/issues/4015)
+* fix: the counts inside `RowDescription`, `ParameterDescription`, `CopyInResponse` and `CopyOutResponse` are checked against the declared message length. A `RowDescription` claiming more fields than its length can hold previously read its field descriptions out of the messages that followed it [Issue #4015](https://github.com/pgjdbc/pgjdbc/issues/4015)
+* fix: the driver checks that each backend message was consumed exactly before reading the next message type, so a reader that stops short of its declared length is refused rather than misreading what follows [Issue #4015](https://github.com/pgjdbc/pgjdbc/issues/4015)
+* fix: the authentication loop, the GSS encryption handshake and the GSS authentication handshake each stop after 64 round trips. A zero-length GSS token is a valid continuation, so a server could previously keep a client exchanging tokens forever before any credentials were exchanged [Issue #4015](https://github.com/pgjdbc/pgjdbc/issues/4015)
+* fix: `ErrorResponse` before authentication is limited to 30000 bytes rather than 32 MiB, matching libpq's limit for messages outside `VALID_LONG_MESSAGE_TYPE`, and a C string inside a declared message is no longer scanned past the end of that message. Both were allocations an unauthenticated peer could cause [Issue #4015](https://github.com/pgjdbc/pgjdbc/issues/4015)
+* fix: an `ErrorResponse` or `NoticeResponse` longer than 32 MiB is truncated to that size rather than refused. The body past the limit is drained and the shortened message is delivered, so the connection stays usable [Issue #4015](https://github.com/pgjdbc/pgjdbc/issues/4015)
+* fix: the read buffer returns to its initial size once the message that grew it is drained, so a connection no longer retains 32 MiB after one large error [Issue #4015](https://github.com/pgjdbc/pgjdbc/issues/4015)
+* fix: exceeding `maxResultBuffer` closes the connection. The row is not read past the limit, so the connection cannot continue, and it is now dropped where the limit is exceeded rather than refused as a protocol violation at the next message. The error reported is the limit alone, with SQLState `08S01` as before [Issue #4015](https://github.com/pgjdbc/pgjdbc/issues/4015)
+
+## [42.7.13] (2026-07-06)
+
+### Added
+* feat: invalidate the prepared-statement cache when the server reports a `search_path` change via GUC_REPORT (PostgreSQL 18+), so cached plans are no longer used against the wrong schema [PR #4259](https://github.com/pgjdbc/pgjdbc/pull/4259)
+* feat: `reWriteBatchedInserts` now merges up to 32768 rows into one multi-values `INSERT` (bounded by the 65535 bind-parameter limit on the extended protocol) instead of capping at 128, which speeds up batches of few-column rows. The new `reWriteBatchedInsertsSize` connection property lowers that cap when set; the default of `0` uses that maximum. [PR #4207](https://github.com/pgjdbc/pgjdbc/pull/4207)
+* feat: invalidate the prepared-statement cache after CREATE/DROP/ALTER so callers no longer trip on "cached plan must not change result type" without opting into `autosave=ALWAYS`. Controlled by the new `flushCacheOnDdl` connection property (default `true`); set to `false` for the prior behaviour. [PR #4067](https://github.com/pgjdbc/pgjdbc/pull/4067)
+* feat: add `connectExecutor` connection property to customize the `Executor` used to run the worker task that performs the connection attempt when `loginTimeout` is in effect. The value is the fully qualified name of a class implementing `java.util.concurrent.Executor`. With a null value, the default, the driver retains the prior behavior of running the connection attempt on a daemon thread named `"PostgreSQL JDBC driver connection thread"`. The executor must run the task on a thread other than the caller's. Running the attempt on a named thread lets applications that monitor driver-created threads identify it. [PR #4165](https://github.com/pgjdbc/pgjdbc/pull/4165)
+* feat: add `classLoaderStrategy` connection property to control which classloaders the driver searches when loading a class named by a connection property, for example `socketFactory`. The default `driver-first` now falls back to the thread context classloader when the driver's classloader cannot resolve the class, which fixes class loading in non-flat class paths such as Quarkus and OSGi. Set `driver` to keep the previous driver-classloader-only behaviour, or `context-first` to prefer the thread context classloader [Issue #2112](https://github.com/pgjdbc/pgjdbc/issues/2112) [PR #4167](https://github.com/pgjdbc/pgjdbc/pull/4167)
+* feat: add OID constants for geometric arrays, `RECORD`, and `refcursor` [PR #4220](https://github.com/pgjdbc/pgjdbc/pull/4220)
+* feat: `LargeObject` `BlobInputStream` now skips by seeking instead of reading, and the driver exposes the server version so it can select the 64-bit large-object API where available [PR #4204](https://github.com/pgjdbc/pgjdbc/pull/4204)
+
+### Changed
+* refactor: the worker that runs the connection attempt under `loginTimeout` is now a `FutureTask` (`ConnectTask`) instead of the hand-rolled `ConnectThread`. When the caller hits the timeout, the task is now cancelled with `cancel(true)`, which interrupts the worker thread rather than letting it run to completion. This makes the connection attempt interruptible, so `loginTimeout` can stop a slow connection attempt instead of leaking a thread. As before, a connection that the worker still manages to establish after the caller gives up is closed by the worker so that it does not leak. There are no public API changes and this should only lead to faster background resource cleanup for connections that time out. [PR #4120](https://github.com/pgjdbc/pgjdbc/pull/4120)
+* chore: `PGXAConnection.ConnectionHandler` now rejects `setAutoCommit(false)` and `setSavepoint(...)` during an active XA branch, in addition to the long-rejected `setAutoCommit(true)` / `commit()` / `rollback()`. The `setSavepoint` rejection was already meant to be in place but the guard misspelled the method name as `setSavePoint`, so savepoints silently went through. Both changes bring the proxy in line with JTA 1.2 §3.4. [PR #4114](https://github.com/pgjdbc/pgjdbc/pull/4114)
+* chore: `commitPrepared` / `rollback`-of-prepared now return `XAER_RMFAIL` instead of `XAER_RMERR` when the underlying connection is left in a non-idle `TransactionState`. Transaction managers (Geronimo, Narayana, Atomikos) treat `XAER_RMFAIL` as retryable on a fresh `XAResource`; the prepared transaction is no longer abandoned. [PR #4114](https://github.com/pgjdbc/pgjdbc/pull/4114)
+* refactor: derive `getPrimaryKeys` from `pg_constraint.conkey` [PR #4202](https://github.com/pgjdbc/pgjdbc/pull/4202)
+
+### Fixed
+* fix: the published GitHub release now ships the released `postgresql-<version>.jar` and its detached PGP signature, taken from the same signed build that is uploaded to Maven Central, instead of a leftover SNAPSHOT jar [Issue #3812](https://github.com/pgjdbc/pgjdbc/issues/3812) [PR #3814](https://github.com/pgjdbc/pgjdbc/pull/3814)
+* fix: simplify the `Statement#cancel` state machine by dropping the redundant `CANCELLED` state. `killTimerTask` now waits for the state to return to `IDLE` directly, which removes a spin-forever case when more than one thread observes the cancel completing [PR #1827](https://github.com/pgjdbc/pgjdbc/pull/1827).
+* perf: defer simple-query flushes until the driver reads the response, allowing `BEGIN` and the following query to share a network flush [Issue #3894](https://github.com/pgjdbc/pgjdbc/issues/3894) [PR #4196](https://github.com/pgjdbc/pgjdbc/pull/4196)
+* fix: `reWriteBatchedInserts` no longer throws `IllegalArgumentException` when batching a parameterless `INSERT` (for example `INSERT INTO t VALUES (1, 2)`) of 256 rows or more [PR #4207](https://github.com/pgjdbc/pgjdbc/pull/4207)
+* fix: a comment before `CALL` in a `CallableStatement` no longer hides the native call, so OUT parameter registration works for `/* comment */ call proc(?, ?)` and similar. `Parser.modifyJdbcCall` now skips leading whitespace and SQL comments (both `--` and `/* */`) before the call, tolerates a trailing comment after a `{ ... }` escape, and no longer adds a spurious comma when moving an OUT parameter into a call whose arguments are only a comment [Issue #2538](https://github.com/pgjdbc/pgjdbc/issues/2538) [PR #4209](https://github.com/pgjdbc/pgjdbc/pull/4209)
+* fix: `PreparedStatement.toString()` no longer throws for a `bytea` value supplied as text via `PGobject`. Hex-format values (`\x...`) are validated and rendered as a `bytea` literal, and escape-format values are quoted and cast like any other literal [Issue #3757](https://github.com/pgjdbc/pgjdbc/issues/3757) [PR #4201](https://github.com/pgjdbc/pgjdbc/pull/4201)
+* fix: the driver no longer nulls the `contextClassLoader` of shared `ForkJoinPool.commonPool()` worker threads, which previously left unrelated tasks on those threads running with a `null` classloader [Issue #4155](https://github.com/pgjdbc/pgjdbc/issues/4155) [PR #4156](https://github.com/pgjdbc/pgjdbc/pull/4156)
+* fix: `PgResultSet#getCharacterStream` wraps `String` in a `StringReader` [PR #4063](https://github.com/pgjdbc/pgjdbc/pull/4063)
+* fix: `PGXAConnection` no longer saves and restores the underlying connection's JDBC `autoCommit` flag. All XA-protocol SQL (`BEGIN`, `PREPARE TRANSACTION`, `COMMIT`, `ROLLBACK`, `COMMIT PREPARED`, `ROLLBACK PREPARED`, the `recover()` SELECT) is sent through `QUERY_SUPPRESS_BEGIN`, so the caller's `autoCommit` value is invariant across every `XAResource` call. Fixes the "2nd phase commit must be issued using an idle connection" failure during recovery on managed datasources that pool connections with `autoCommit=false` (TomEE, WildFly, WebSphere Liberty) [PR #4114](https://github.com/pgjdbc/pgjdbc/pull/4114)
+* fix: `PGXAConnection.prepare()` now mutates XA state only after `PREPARE TRANSACTION` succeeds. A failed `PREPARE` previously left the driver thinking the branch was already prepared, so the follow-up `rollback(xid)` tried `ROLLBACK PREPARED` against a non-existent gid and returned `XAER_RMERR`. Transaction managers (Narayana) escalated this to `HeuristicMixedException`. With the fix, `rollback(xid)` takes the active-branch path and issues a plain `ROLLBACK`, which the server accepts cleanly. Fixes [Issue #3153](https://github.com/pgjdbc/pgjdbc/issues/3153), [Issue #3123](https://github.com/pgjdbc/pgjdbc/issues/3123). [PR #4114](https://github.com/pgjdbc/pgjdbc/pull/4114)
+* fix: an updatable result set over an unqualified table name is now classified using only the table visible through `search_path`. When two schemas held a table with the same name and the same primary or unique index name but a different set of key columns, the driver took the union of both schemas' columns, so the result set could be wrongly rejected as not updatable [PR #4214](https://github.com/pgjdbc/pgjdbc/pull/4214). Supersedes [PR #3400](https://github.com/pgjdbc/pgjdbc/pull/3400).
+* fix: `LargeObject.close()` now flushes a buffered output stream before marking the object closed, so closing a large object without an explicit `flush()` no longer drops buffered writes. The flush runs while the object is still open (it calls back into `LargeObject.write()`), and `lo_close` always runs afterward; a failure from `lo_close` no longer masks an earlier flush error, and the transaction is not committed when the flush failed [Issue #4247](https://github.com/pgjdbc/pgjdbc/issues/4247) [PR #4248](https://github.com/pgjdbc/pgjdbc/pull/4248).
+* fix: reject empty `timestamp`, `timestamptz`, and `date` text with a clear `SQLException` (SQLState `22007`) instead of an `ArrayIndexOutOfBoundsException` [PR #4278](https://github.com/pgjdbc/pgjdbc/pull/4278)
+* fix: return null `CHAR_OCTET_LENGTH` for non-character columns [PR #4231](https://github.com/pgjdbc/pgjdbc/pull/4231)
+* fix: honor scale in `ResultSet.getBigDecimal(int, int)` [PR #4211](https://github.com/pgjdbc/pgjdbc/pull/4211)
+* fix: support `java.time` values in an updatable `ResultSet` `updateRow()` / `insertRow()` [PR #3848](https://github.com/pgjdbc/pgjdbc/pull/3848)
+* fix: improve batching when the `RETURNING` clause contains `varchar` or `numeric` types [PR #4014](https://github.com/pgjdbc/pgjdbc/pull/4014)
+* fix: correct `estimatedReceiveBufferBytes` accounting after a forced `Sync` [PR #4014](https://github.com/pgjdbc/pgjdbc/pull/4014)
+* fix: avoid creating a transient `ResultSet` for describe-statement purposes, and restore the pre-describe path for generated-key batches [PR #4014](https://github.com/pgjdbc/pgjdbc/pull/4014)
+* fix: add an explicit failure message when a multi-statement command executes in a batch [PR #4014](https://github.com/pgjdbc/pgjdbc/pull/4014)
+* fix: detect `search_path` changes case-insensitively [PR #4216](https://github.com/pgjdbc/pgjdbc/pull/4216)
+* fix: auto-detect the SSL key format instead of relying on the `.key` extension [PR #3946](https://github.com/pgjdbc/pgjdbc/pull/3946)
+* fix: build PKIX trust anchors without a `KeyStore` so FIPS JVMs work [PR #4193](https://github.com/pgjdbc/pgjdbc/pull/4193)
+* fix: use `gssResponseTimeout` rather than `sslResponseTimeout` for GSS connections [PR #4076](https://github.com/pgjdbc/pgjdbc/pull/4076)
+* fix: skip the autosave savepoint for `SET LOCAL` / `SET SESSION TRANSACTION` [PR #4203](https://github.com/pgjdbc/pgjdbc/pull/4203)
+* fix: do not throw `AssertionError` from `BatchResultHandler` on a closed connection [PR #4187](https://github.com/pgjdbc/pgjdbc/pull/4187)
+* fix: reject `SQL_TSI_FRAC_SECOND` with an explicit, explained error [PR #4229](https://github.com/pgjdbc/pgjdbc/pull/4229)
+* fix: reject a null URL in `Driver.acceptsURL` with a clear `NullPointerException` [PR #4205](https://github.com/pgjdbc/pgjdbc/pull/4205)
+* fix: reject overlong inputs in `NumberParser.getFastLong` instead of silently wrapping [PR #4163](https://github.com/pgjdbc/pgjdbc/pull/4163)
+* fix: reject out-of-range and NaN values in `PGInterval.setSeconds` [PR #4194](https://github.com/pgjdbc/pgjdbc/pull/4194)
+* fix: close the socket when `PgConnection` setup fails after connect [PR #4161](https://github.com/pgjdbc/pgjdbc/pull/4161)
+* fix: keep the `LazyCleanerImpl` cleanup task alive across a transient empty queue [PR #4038](https://github.com/pgjdbc/pgjdbc/pull/4038)
+* fix: append the default non-proxy hosts when `socksNonProxyHosts` is set [PR #4045](https://github.com/pgjdbc/pgjdbc/pull/4045)
+* fix: clear the `ResourceBundle` cache on deregister so the driver can unload [PR #4237](https://github.com/pgjdbc/pgjdbc/pull/4237)
+* fix: delete the temp file when spooling a stream to disk fails with an `IOException` [PR #4190](https://github.com/pgjdbc/pgjdbc/pull/4190)
+* fix: avoid a direct `java.lang.management` dependency in the `maxResultBuffer` parser [PR #4069](https://github.com/pgjdbc/pgjdbc/pull/4069)
+
+## [42.7.12] (2026-06-29)
+
+### Security
+* fix: Enforce SCRAM channel-binding policy and prevent silent downgrade.
+Under `channelBinding=require`, the driver silently downgraded from `SCRAM-SHA-256-PLUS` (with channel binding) to plain `SCRAM-SHA-256` (without it) when the server presented a certificate whose signature algorithm has no `tls-server-end-point` channel-binding hash (e.g. Ed25519, Ed448, or post-quantum algorithms). An attacker who can intercept the TLS connection could exploit this to strip channel-binding protection.
+The fix enforces channel binding in the driver's own code: it now fails the connection when no binding data can be extracted, and verifies the negotiated mechanism uses channel binding (`-PLUS`) when `require` is set.
+Only connections that set `channelBinding=require` are affected. The default `prefer` policy and releases before 42.7.4 (which introduced channel-binding support) are unaffected.
+See the [Security Advisory](https://github.com/pgjdbc/pgjdbc/security/advisories/GHSA-j92g-9f8w-j867) for more detail.
+The following [CVE-2026-54291](https://nvd.nist.gov/vuln/detail/CVE-2026-54291) has been issued.
+
+## [42.7.11] (2026-04-28)
+
+### Security
+* fix: Limit SCRAM PBKDF2 iterations accepted from the server.
+pgjdbc was vulnerable to a client-side denial of service in SCRAM-SHA-256 authentication, where a malicious or compromised PostgreSQL server could specify an extremely large PBKDF2 iteration count, causing the client to consume unbounded CPU and potentially exhaust connection pools. The fix introduces a new scramMaxIterations connection property (defaulting to 100,000) to cap iteration counts before computation begins.
+See the [Security Advisory](https://github.com/pgjdbc/pgjdbc/security/advisories/GHSA-98qh-xjc8-98pq) for more detail.
+The following [CVE-2026-42198](https://nvd.nist.gov/vuln/detail/CVE-2026-42198) has been issued.
+
+### Added
+* feat: implement require_auth connection property, aligning with libpq behavior [PR #3895](https://github.com/pgjdbc/pgjdbc/pull/3895)
+
+### Changed
+* chore: replace Appveyor CI with ikalnytskyi/action-setup-postgres [PR #3966](https://github.com/pgjdbc/pgjdbc/pull/3966)
+* chore: upgrade Gradle to v9 [PR #3978](https://github.com/pgjdbc/pgjdbc/pull/3978)
+
+### Fixed
+* fix: ensure extended protocol messages end with Sync message [PR #3728](https://github.com/pgjdbc/pgjdbc/pull/3728)
+* fix: enable cursor-based fetching in extended protocol when transaction started via SQL command [PR #3996](https://github.com/pgjdbc/pgjdbc/pull/3996)
+* fix: retry with SSL on IOException when sslMode=ALLOW [PR #3973](https://github.com/pgjdbc/pgjdbc/pull/3973)
+* fix: make sure the driver honours connectTimeout when retrying the connection [PR #3968](https://github.com/pgjdbc/pgjdbc/pull/3968)
+* fix: allow fallback to non-SSL connection when sslMode=prefer and sslResponseTimeout kicks in [PR #3968](https://github.com/pgjdbc/pgjdbc/pull/3968)
+* fix: catch SecurityException from setContextClassLoader on ForkJoinPool workers [PR #3962](https://github.com/pgjdbc/pgjdbc/pull/3962)
+* fix: use compareTo for LogSequenceNumber comparison to handle unsigned values correctly [PR #3961](https://github.com/pgjdbc/pgjdbc/pull/3961)
+* fix: release COPY lock on IOException to prevent connection hang [PR #3957](https://github.com/pgjdbc/pgjdbc/pull/3957)
+* fix: return jsonb as PGObject instead of String [PR #3956](https://github.com/pgjdbc/pgjdbc/pull/3956)
+* fix: align SSL key file permission check with libpq [PR #3952](https://github.com/pgjdbc/pgjdbc/pull/3952)
+* fix: guard connection closed flag with a reentrant lock to protect against concurrent close [PR #3905](https://github.com/pgjdbc/pgjdbc/pull/3905)
+
+## [42.7.10] (2026-02-11)
+
+### Changed
+* chore: Migrate to Shadow 9 [PR 3931](https://github.com/pgjdbc/pgjdbc/pull/3931)
+* style: fix empty line before javadoc for checkstyle compliance [PR #3925](https://github.com/pgjdbc/pgjdbc/pull/3925)
+* style: fix lambda argument indentation for checkstyle compliance [PR #3922](https://github.com/pgjdbc/pgjdbc/pull/3922)
+* test: add autosave=always|never|conservative and cleanupSavepoints=true|false to the randomized CI jobs [PR #3917](https://github.com/pgjdbc/pgjdbc/pull/3917)
+
+### Fixed
+* fix: non-standard strings failing test for version 19 [PR #3934](https://github.com/pgjdbc/pgjdbc/pull/3934)
+* fix: small issues in ConnectionFactoryImpl [PR #3929](https://github.com/pgjdbc/pgjdbc/pull/3929)
+* fix: process pending responses before fastpath to avoid protocol errors [PR # 3913](https://github.com/pgjdbc/pgjdbc/pull/3913)
+* doc: use.md, fix typos [PR #3911](https://github.com/pgjdbc/pgjdbc/pull/3911)
+* doc: datasource.md, fix minor formatting issue [PR #3912](https://github.com/pgjdbc/pgjdbc/pull/3912)
+* doc: add the new PGP signing key to the official documentation [PR #3912](https://github.com/pgjdbc/pgjdbc/pull/3813)
+
+### Reverted
+* Revert "fix: make all Calendar instances proleptic Gregorian (#3837) (#3887)" [PR #3932](https://github.com/pgjdbc/pgjdbc/pull/3932)
+
+## [42.7.9] (2026-01-14)
+
+### Added
+* feat: query timeout property [PR #3705](https://github.com/pgjdbc/pgjdbc/pull/3705)
+* feat: Add PEMKeyManager to handle PEM based certs and keys [PR #3700](https://github.com/pgjdbc/pgjdbc/pull/3700)
+
+### Changed
+* perf: optimize PGInterval.getValue() by replacing String.format with StringBuilder
+* doc: update property quoteReturningIdentifiers default value [PR #3847](https://github.com/pgjdbc/pgjdbc/pull/3847)
+* security: Use a static method forName to load all user supplied classes. Use the Class.forName 3 parameter method and do not initilize it unless it is a subclass of the expected class
+
+### Fixed
+* fix: incorrect pg_stat_replication.reply_time calculation [PR #3906](https://github.com/pgjdbc/pgjdbc/pull/3906)
+* fix: close temporary lob descriptors that are used internally in PreparedStatement#setBlob
+* fix: PGXAConnection.prepare(Xid) should return XA_RDONLY if the connection is read only [PR #3897](https://github.com/pgjdbc/pgjdbc/pull/3897)
+* fix: make all Calendar instances proleptic Gregorian [PR #3837](https://github.com/pgjdbc/pgjdbc/pull/3887)
+* fix: Simplify concurrency guards on QueryExecutorBase#transaction and QueryExecutorBase#standardConformingStrings [PR #3897](https://github.com/pgjdbc/pgjdbc/pull/3849)
+*  fix: avoid memory leaks in Java <= 21 caused by Thread.inheritedAccessControlContext [PR #3886](https://github.com/pgjdbc/pgjdbc/pull/3886)
+* fix: Issue #3784 pgjdbc can't decode numeric arrays containing special numbers like NaN [PR #3838](https://github.com/pgjdbc/pgjdbc/pull/3838)
+* fix: use ssl_is_used() to check for ssl connection [PR #3867](https://github.com/pgjdbc/pgjdbc/pull/3867)
+* fix: the classloader is nullable [PR #3907](https://github.com/pgjdbc/pgjdbc/pull/3907)
+
+## [42.7.8] (2025-09-18)
+
+### Added
+* feat: Add configurable boolean-to-numeric conversion for ResultSet getters [PR #3796](https://github.com/pgjdbc/pgjdbc/pull/3796)
+
+### Changed
+* perf: remove QUERY_ONESHOT flag when calling getMetaData [PR #3783](https://github.com/pgjdbc/pgjdbc/pull/3783)
+* perf: use `BufferedInputStream` with `FileInputStream` [PR #3750](https://github.com/pgjdbc/pgjdbc/pull/3750)
+* perf: enable server-prepared statements for DatabaseMetaData
+
+### Fixed
+* fix: avoid NullPointerException when cancelling a query if cancel key is not known yet
+* fix: Change "PST" timezone in TimestampTest to "Pacific Standard Time" [PR #3774](https://github.com/pgjdbc/pgjdbc/pull/3774)
+* fix: traverse the current dimension to get the correct pos in PgArray#calcRemainingDataLength [PR #3746](https://github.com/pgjdbc/pgjdbc/pull/3746)
+* fix: make sure getImportedExportedKeys returns columns in consistent order
+* fix: Add "SELF_REFERENCING_COL_NAME" field to getTables' ResultSetMetaData to fix NullPointerException [PR #3660](https://github.com/pgjdbc/pgjdbc/pull/3660)
+* fix: unable to open replication connection to servers < 12
+* fix: avoid closing statement caused by driver's internal ResultSet#close()
+* fix: return empty metadata for empty catalog names as it was before
+* fix: Incorrect class comparison in PGXmlFactoryFactory validation
+
+## [42.7.7] (2025-06-10)
+
+### Security
+* security: **Client Allows Fallback to Insecure Authentication Despite channelBinding=require configuration.**
+Fix `channel binding required` handling to reject non-SASL authentication 
+Previously, when channel binding was set to "require", the driver would silently ignore this 
+requirement for non-SASL authentication methods. This could lead to a false sense of security 
+when channel binding was explicitly requested but not actually enforced. The fix ensures that when 
+channel binding is set to "require", the driver will reject connections that use 
+non-SASL authentication methods or when SASL authentication has not completed properly. 
+See the [Security Advisory](https://github.com/pgjdbc/pgjdbc/security/advisories/GHSA-hq9p-pm7w-8p54) for more detail. Reported by [George MacKerron](https://github.com/jawj)
+The following [CVE-2025-49146](https://nvd.nist.gov/vuln/detail/CVE-2025-49146) has been issued
+
+
+### Added
+* test: Added ChannelBindingRequiredTest to verify proper behavior of channel binding settings
+
+## [42.7.6]
+
+#### Features
+* fix: Enhanced DatabaseMetadata.getIndexInfo() method, added index comment as REMARKS property [PR #3513](https://github.com/pgjdbc/pgjdbc/pull/3513)
+
+### Performance Improvements
+* performance: Improve ResultSetMetadata.fetchFieldMetaData by using IN row values instead of UNION ALL for improved query performance (later reverted) [PR #3510](https://github.com/pgjdbc/pgjdbc/pull/3510)
+* feat:Use a single simple query for all startup parameters, so groupStartupParameters is no longer needed  [PR #3613](https://github.com/pgjdbc/pgjdbc/pull/3613)
+* 
+## Bug Fixes
+
+### Protocol & Connection Handling
+* fix: Send extra_float_digits=3 for PostgreSQL 12+ as well  [PR #3491](https://github.com/pgjdbc/pgjdbc/pull/3491)
+* fix: Fixed handling of protocol 3.2 and wider cancel keys [PR #3592](https://github.com/pgjdbc/pgjdbc/pull/3592)
+* fix: Made PgConnection#abort compatible with Java 24 [PR #3582](https://github.com/pgjdbc/pgjdbc/pull/3582)
+* fix: Fixed ArrayIndexOutOfBounds when writing big objects into GSS enabled connections [PR #3500](https://github.com/pgjdbc/pgjdbc/pull/3500)
+* fix: Added back application name setting [PR #3509](https://github.com/pgjdbc/pgjdbc/pull/3509)
+
+### Metadata & Catalog Handling
+* fix: Set column name explicitly when using current_database() in queries [PR #3526](https://github.com/pgjdbc/pgjdbc/pull/3526)
+* fix: Use query to find the current catalog instead of relying on the database in the connection URL [pull #3565](https://github.com/pgjdbc/pgjdbc/pull/3565)
+* fix: Refactored empty resultset to use empty result set if the catalog is not correct [PR #3588](https://github.com/pgjdbc/pgjdbc/pull/3588)
+
+### API Improvements
+* fix: Undeprecated Fastpath API and fixed deprecation warnings [PR #3493](https://github.com/pgjdbc/pgjdbc/pull/3493)
+* fix: Undeprecated sslfactoryarg [PR #3496](https://github.com/pgjdbc/pgjdbc/pull/3496)
+* fix: Added PgMessageType and used static variables for protocol literals [PR #3609](https://github.com/pgjdbc/pgjdbc/pull/3609)
+* fix: Add the ability to turn off automatic LSN flush [PR #3403](https://github.com/pgjdbc/pgjdbc/pull/3403)
+* fix: isValid incorrectly called execute, instead of executeWithFlags [PR #3631](https://github.com/pgjdbc/pgjdbc/pull/3631). Fixes [Issue #3630](https://github.com/pgjdbc/pgjdbc/issues/3630)
+* fix: EOFException on PreparedStatement#toString with unset bytea parameter since 42.7.4 [Commit 0a88ea4](https://github.com/pgjdbc/pgjdbc/commit/0a88ea425e86dce691a96d6aa7023c20ac887b98). Fixes [Issue #3365](https://github.com/pgjdbc/pgjdbc/issues/3365)
+
+## Infrastructure & Build Improvements
+
+### Java Support
+* update: Updated to use Java 21 for building pgjdbc by default [PR #3612](https://github.com/pgjdbc/pgjdbc/pull/3612)
+* update: Updated Java 21 as the build dependency for copr [PR #3607](https://github.com/pgjdbc/pgjdbc/pull/3607)
+* update: Updated latest JDK to version 24 [PR #3580](https://github.com/pgjdbc/pgjdbc/pull/3580)
+* update: Applied the latest byte-buddy version for tests to support the latest Java versions [PR #3583](https://github.com/pgjdbc/pgjdbc/pull/3583)
+
+### Testing & Quality
+* test: Added ErrorProne verification to detect bugs earlier [PR #3493](https://github.com/pgjdbc/pgjdbc/pull/3493)
+* test: Simplified TestUtil.openDB, added tests with various assumeMinServerVersion values [PR #3624](https://github.com/pgjdbc/pgjdbc/pull/3614)
+* test: Updated to use PostgreSQL 17 rather than 17rc1 for CI tests [PR #3501](https://github.com/pgjdbc/pgjdbc/pull/3501)
+* test: Removed stale logging message from SslTest [PR #3584](https://github.com/pgjdbc/pgjdbc/pull/3584)
+* test: Added CI executions with adaptive_fetch=true by default for performance testing [PR #3615](https://github.com/pgjdbc/pgjdbc/pull/3615)
+* test: Added tests with reWriteBatchedInserts=true [PR #3616](https://github.com/pgjdbc/pgjdbc/pull/3616)
+
+
+### Code Quality
+* doc: Fixed javadoc warnings [PR #3493](https://github.com/pgjdbc/pgjdbc/pull/3493)
+* chore: Added missing @Override annotations [commit #4f986ff8](https://github.com/pgjdbc/pgjdbc/commit/4f986ff8)
+* chore: Fixed empty catch block warnings [commit #840fdab9](https://github.com/pgjdbc/pgjdbc/commit/840fdab9)
+* chore: Fixed unused variables [commit #2d3b00c2](https://github.com/pgjdbc/pgjdbc/commit/2d3b00c2)
+* refactor: Made private methods that do not use instance fields static [commit #ddb71441](https://github.com/pgjdbc/pgjdbc/commit/ddb71441)
+* fix: Fixed .equals when comparing offsetDateTime with OffsetDateTime.MIN and OffsetDateTime.MAX [commit #2bf410af](https://github.com/pgjdbc/pgjdbc/commit/2bf410af)
+* refactor: Factored out duplicated .getBytes() when converting date/time to Date/Time/Timestamp [commit #882b97f9](https://github.com/pgjdbc/pgjdbc/commit/882b97f9)
+
+## Dependency Updates
+* Updated numerous dependencies including:
+* Gradle to 8.14
+* Checkerframework to v3.49.3
+* JUnit to v5.12.2
+* Spotbugs to v4.9.3
+* Checkstyle to v10.23.1
+* Hamcrest to v3
+* Error Prone Core to v2.38.0
+* Byte Buddy to v1.17.5
+* JaCoCo to v0.8.13
+
+## Documentation
+* docs: Corrected location for 42.2.29 changelogs [commit #bb276568](https://github.com/pgjdbc/pgjdbc/commit/bb276568)
+* docs: Fixed naming of release note [commit #032d0e22](https://github.com/pgjdbc/pgjdbc/commit/032d0e22)
+
+## Removed
+* chore: Removed unused Travis CI configuration [PR #3498](https://github.com/pgjdbc/pgjdbc/pull/3498)
+* chore: Excluded Oracle Java 17 from CI tests [PR #3499](https://github.com/pgjdbc/pgjdbc/pull/3499)
+* fix: Removed workaround which was needed for an old checkstyle [commit #4500ea04](https://github.com/pgjdbc/pgjdbc/commit/4500ea04)
+
+
+## [42.7.5] (2025-01-14 08:00:00 -0400)
+
+### Added
+* ci: Test with Java 23  [PR #3381](https://github.com/pgjdbc/pgjdbc/pull/3381)
+
+### Fixed
+* regression: revert change in fc60537 [PR #3476](https://github.com/pgjdbc/pgjdbc/pull/3476)
+* fix: PgDatabaseMetaData implementation of catalog as param and return value [PR #3390](https://github.com/pgjdbc/pgjdbc/pull/3390)
+* fix: Support default GSS credentials in the Java Postgres client [PR #3451](https://github.com/pgjdbc/pgjdbc/pull/3451)
+* fix: return only the transactions accessible by the current_user in XAResource.recover [PR #3450](https://github.com/pgjdbc/pgjdbc/pull/3450)
+* feat: don't force send extra_float_digits for PostgreSQL >= 12 fix [Issue #3432](https://github.com/pgjdbc/pgjdbc/issues/3432)  [PR #3446](https://github.com/pgjdbc/pgjdbc/pull/3446)
+* fix: exclude "include columns" from the list of primary keys [PR #3434](https://github.com/pgjdbc/pgjdbc/pull/3434)
+* perf: Enhance the meta query performance by specifying the oid. [PR #3427](https://github.com/pgjdbc/pgjdbc/pull/3427)
+* feat: support getObject(int, byte[].class) for bytea [PR #3274](https://github.com/pgjdbc/pgjdbc/pull/3274)
+* docs: document infinity and some minor edits [PR #3407](https://github.com/pgjdbc/pgjdbc/pull/3407)
+* fix: Added way to check for major server version, fixed check for RULE [PR #3402](https://github.com/pgjdbc/pgjdbc/pull/3402)
+* docs: fixed remaining paragraphs [PR #3398](https://github.com/pgjdbc/pgjdbc/pull/3398)
+* docs: fixed paragraphs in javadoc comments  [PR #3397](https://github.com/pgjdbc/pgjdbc/pull/3397)
+* fix: Reuse buffers and reduce allocations in GSSInputStream addresses [Issue #3251](https://github.com/pgjdbc/pgjdbc/issues/3251) [PR #3255](https://github.com/pgjdbc/pgjdbc/pull/3255)
+* chore: Update Gradle to 8.10.2 [PR #3388](https://github.com/pgjdbc/pgjdbc/pull/3388)
+* fix: getSchemas() [PR #3386](https://github.com/pgjdbc/pgjdbc/pull/3386)
+* fix: Update rpm postgresql-jdbc.spec.tpl with scram-client [PR #3324](https://github.com/pgjdbc/pgjdbc/pull/3324)
+* fix: Clearing thisRow and rowBuffer on close() of ResultSet [Issue #3383](https://github.com/pgjdbc/pgjdbc/issues/3383) [PR #3384](https://github.com/pgjdbc/pgjdbc/pull/3384)
+* fix: Package was renamed to maven-bundle-plugin [PR #3382](https://github.com/pgjdbc/pgjdbc/pull/3382)
+* fix: As of version 18 the RULE privilege has been removed [PR #3378](https://github.com/pgjdbc/pgjdbc/pull/3378)
+* fix: use buffered inputstream to create GSSInputStream [PR #3373](https://github.com/pgjdbc/pgjdbc/pull/3373)
+* test: get rid of 8.4, 9.0 pg versions and use >= jdk version 17 [PR #3372](https://github.com/pgjdbc/pgjdbc/pull/3372)
+* Changed docker-compose version and renamed script file in instructions to match the real file name [PR #3363](https://github.com/pgjdbc/pgjdbc/pull/3363)
+* test:Do not assume "test" database in DatabaseMetaDataTransactionIsolationTest [PR #3364](https://github.com/pgjdbc/pgjdbc/pull/3364)
+* try to categorize dependencies [PR #3362](https://github.com/pgjdbc/pgjdbc/pull/3362)
+## [42.7.4] (2024-08-22 08:00:00 -0400)
+
+### Added
+* chore: SCRAM dependency to 3.1 and support channel binding [PR #3188](https://github.com/pgjdbc/pgjdbc/pull/3188)
+* chore: Add PostgreSQL 15, 16, and 17beta1 to CI tests [PR #3299](https://github.com/pgjdbc/pgjdbc/pull/3299)
+* test: Update to 17beta3 [PR #3308](https://github.com/pgjdbc/pgjdbc/pull/3308)
+* chore: Implement direct SSL ALPN connections [PR #3252](https://github.com/pgjdbc/pgjdbc/pull/3252)
+* translation: Add Korean translation file [PR #3276](https://github.com/pgjdbc/pgjdbc/pull/3276)
+
+### Fixed
+* fix: PgInterval ignores case for represented interval string [PR #3344](https://github.com/pgjdbc/pgjdbc/pull/3344)
+* perf: Avoid extra copies when receiving int4 and int2 in PGStream [PR #3295](https://github.com/pgjdbc/pgjdbc/pull/3295)
+* fix: Add support for Infinity::numeric values in ResultSet.getObject [PR #3304](https://github.com/pgjdbc/pgjdbc/pull/3304)
+* fix: Ensure order of results for getDouble [PR #3301](https://github.com/pgjdbc/pgjdbc/pull/3301)
+* perf: Replace BufferedOutputStream with unsynchronized PgBufferedOutputStream, allow configuring different Java and SO_SNDBUF buffer sizes [PR #3248](https://github.com/pgjdbc/pgjdbc/pull/3248)
+* fix: Fix SSL tests [PR #3260](https://github.com/pgjdbc/pgjdbc/pull/3260)
+* fix: Support bytea in preferQueryMode=simple [PR #3243](https://github.com/pgjdbc/pgjdbc/pull/3243)
+* fix:  Fix #3234 - Return -1 as update count for stored procedure calls [PR #3235](https://github.com/pgjdbc/pgjdbc/pull/3235)
+* fix:  Fix #3224 - conversion for TIME '24:00' to LocalTime breaks in binary-mode [PR #3225](https://github.com/pgjdbc/pgjdbc/pull/3225)
+* perf:  Speed up getDate by parsing bytes instead of String [PR #3141](https://github.com/pgjdbc/pgjdbc/pull/3141)
+* fix: support PreparedStatement.setBlob(1, Blob) and PreparedStatement.setClob(1, Clob) for lobs that return -1 for length [PR #3136](https://github.com/pgjdbc/pgjdbc/pull/3136)
+* fix: Validates resultset Params in PGStatement constructor. uses assertThro… [PR #3171](https://github.com/pgjdbc/pgjdbc/pull/3171)
+* fix: Validates resultset parameters [PR #3167](https://github.com/pgjdbc/pgjdbc/pull/3167)
+* docs: Replace greater to with greater than [PR #3315](https://github.com/pgjdbc/pgjdbc/pull/3315)
+* docs: Clarify binaryTransfer and prepareThreshold [PR #3338](https://github.com/pgjdbc/pgjdbc/pull/3338)
+* docs: use.md, typo [PR #3314](https://github.com/pgjdbc/pgjdbc/pull/3314)
+* test: Use docker v2 which changes docker-compose to docker compose  [#3339](https://github.com/pgjdbc/pgjdbc/pull/3339)
+* refactor: Merge PgPreparedStatement#setBinaryStream int and long methods [PR #3165](https://github.com/pgjdbc/pgjdbc/pull/3165)
+* test: Test both binaryMode=true,false when creating connections in DatabaseMetaDataTest [PR #3231](https://github.com/pgjdbc/pgjdbc/pull/3231)
+* docs: Fixed typos in all source code and documentations [PR #3242](https://github.com/pgjdbc/pgjdbc/pull/3242)
+* chore: Remove self-hosted runner [PR #3227](https://github.com/pgjdbc/pgjdbc/pull/3227)
+* docs: Add cancelSignalTimeout in README [PR #3190](https://github.com/pgjdbc/pgjdbc/pull/3190)
+* docs: Document READ_ONLY_MODE in README [PR #3175](https://github.com/pgjdbc/pgjdbc/pull/3175)
+* test: Test for +/- infinity double values [PR #3294](https://github.com/pgjdbc/pgjdbc/pull/3294)
+* test: Switch localhost and auth-test around for test-gss [PR #3343](https://github.com/pgjdbc/pgjdbc/pull/3343)
+* fix: remove preDescribe from internalExecuteBatch [PR #2883](https://github.com/pgjdbc/pgjdbc/pull/2883)
+* deps: Update dependency om.ongres.scram:scram-client to 3.2
+
+### Deprecated
+* test: Deprecate all PostgreSQL versions older than 9.1 [PR #3335](https://github.com/pgjdbc/pgjdbc/pull/3335)
+
+
+## [42.7.3] (2024-04-14 14:51:00 -0400)
+
+### Changed
+* chore: gradle config enforces 17+ [PR #3147](https://github.com/pgjdbc/pgjdbc/pull/3147)
+
+### Fixed
+* fix: boolean types not handled in SimpleQuery mode [PR #3146](https://github.com/pgjdbc/pgjdbc/pull/3146)
+    * make sure we handle boolean types in simple query mode
+    * support uuid as well
+    * handle all well known types in text mode and change `else if` to `switch`
+* fix: released new versions of 42.2.29, 42.3.10, 42.4.5, 42.5.6, 42.6.2 to deal with `NoSuchMethodError on ByteBuffer#position` when running on Java 8 
+
+## [42.7.2] (2024-02-21 08:23:00 -0500)
+
+### Security
+* security: SQL Injection via line comment generation, it is possible in `SimpleQuery` mode to generate a line comment by having a placeholder for a numeric with a `-` 
+such as `-?`. There must be second placeholder for a string immediately after. Setting the parameter to a -ve value creates a line comment. 
+This has been fixed in this version fixes [CVE-2024-1597](https://www.cve.org/CVERecord?id=CVE-2024-1597). Reported by [Paul Gerste](https://github.com/paul-gerste-sonarsource). See the [security advisory](https://github.com/pgjdbc/pgjdbc/security/advisories/GHSA-24rp-q3w6-vc56) for more details. This has been fixed in versions 42.7.2, 42.6.1 42.5.5, 42.4.4, 42.3.9, 42.2.28.jre7. See the security advisory for work arounds.
+
+### Changed
+* fix: Use simple query for isValid. Using Extended query sends two messages checkConnectionQuery was never ever set or used, removed [PR #3101](https://github.com/pgjdbc/pgjdbc/pull/3101)
+* perf: Avoid autoboxing bind indexes by @bokken in [PR #1244](https://github.com/pgjdbc/pgjdbc/pull/1244)
+* refactor: Document that encodePassword will zero out the password array, and remove driver's default encodePassword by @vlsi in [PR #3084](https://github.com/pgjdbc/pgjdbc/pull/3084)
+
+### Added
+* feat: Add PasswordUtil for encrypting passwords client side [PR #3082](https://github.com/pgjdbc/pgjdbc/pull/3082)
+
+## [42.7.1] (2023-12-06 08:34:00 -0500)
+
+### Changed
+*  perf: improve performance of PreparedStatement.setBlob, BlobInputStream, and BlobOutputStream with dynamic buffer sizing [PR #3044](https://github.com/pgjdbc/pgjdbc/pull/3044)
+
+### Fixed
+*  fix: Apply connectTimeout before SSLSocket.startHandshake to avoid infinite wait in case the connection is broken [PR #3040](https://github.com/pgjdbc/pgjdbc/pull/3040)
+*  fix: support waffle-jna 2.x and 3.x by using reflective approach for ManagedSecBufferDesc [PR #2720](https://github.com/pgjdbc/pgjdbc/pull/2720) Fixes [Issue #2690](https://github.com/pgjdbc/pgjdbc/issues/2720).
+*  fix: NoSuchMethodError on ByteBuffer#position When Running on Java 8  when accessing arrays, fixes [Issue #3014](https://github.com/pgjdbc/pgjdbc/issues/3014)
+*  Revert "[PR #2925](https://github.com/pgjdbc/pgjdbc/pull/2925) Use canonical DateStyle name" [PR #3035](https://github.com/pgjdbc/pgjdbc/pull/3035)
+   Fixes  [Issue #3008](https://github.com/pgjdbc/pgjdbc/issues/3008)
+*  Revert "[PR ##2973](https://github.com/pgjdbc/pgjdbc/pull/2973) feat: support SET statements combining with other queries with semicolon in PreparedStatement" [PR #3010](https://github.com/pgjdbc/pgjdbc/pull/3010)
+   Fixes [Issue #3007](https://github.com/pgjdbc/pgjdbc/issues/3007)
+*  fix: avoid timezone conversions when sending LocalDateTime to the database [#2852](https://github.com/pgjdbc/pgjdbc/pull/3010)  Fixes [Issue #1390](https://github.com/pgjdbc/pgjdbc/issues/1390)
+   ,[Issue #2850](https://github.com/pgjdbc/pgjdbc/issues/2850)
+   Closes [Issue #1391(https://github.com/pgjdbc/pgjdbc/issues/1391)
+
+
+## [42.7.0] (2023-11-20 09:33:00 -0500)
+
+### Changed
+* fix: Deprecate for removal PGPoint.setLocation(java.awt.Point) to cut dependency to `java.desktop` module. [PR #2967](https://github.com/pgjdbc/pgjdbc/pull/2967)
+* feat: return all catalogs for getCatalogs metadata query closes [ISSUE #2949](https://github.com/pgjdbc/pgjdbc/issues/2949) [PR #2953](https://github.com/pgjdbc/pgjdbc/pull/2953)
+* feat: support SET statements combining with other queries with semicolon in PreparedStatement [PR ##2973](https://github.com/pgjdbc/pgjdbc/pull/2973)
+
+### Fixed
+* chore: add styleCheck Gradle task to report style violations [PR #2980](https://github.com/pgjdbc/pgjdbc/pull/2980)
+* fix: Include currentXid in "Error rolling back prepared transaction" exception message [PR #2978](https://github.com/pgjdbc/pgjdbc/pull/2978)
+* fix: add varbit as a basic type inside the TypeInfoCache [PR #2960](https://github.com/pgjdbc/pgjdbc/pull/2960)
+* fix: Fix failing tests for version 16.  [PR #2962](https://github.com/pgjdbc/pgjdbc/pull/2962)
+* fix: allow setting arrays with ANSI type name [PR #2952](https://github.com/pgjdbc/pgjdbc/pull/2952)
+* feat: Use KeepAlive to confirm LSNs [PR #2941](https://github.com/pgjdbc/pgjdbc/pull/2941)
+* fix: put double ' around log parameter [PR #2936](https://github.com/pgjdbc/pgjdbc/pull/2936) fixes [ISSUE #2935](https://github.com/pgjdbc/pgjdbc/issues/2935)
+* fix: Fix Issue #2928 number of ports not equal to number of servers in datasource [PR #2929](https://github.com/pgjdbc/pgjdbc/pull/2929)
+* fix: Use canonical DateStyle name (#2925) fixes [pgbouncer issue](https://github.com/pgbouncer/pgbouncer/issues/776)
+* fix: Method getFastLong should be able to parse all longs [PR #2881](https://github.com/pgjdbc/pgjdbc/pull/2881)
+* docs: Fix typos in info.html [PR #2860](https://github.com/pgjdbc/pgjdbc/pull/2860)
+* fix: Return correct default from PgDatabaseMetaData.getDefaultTransactionIsolation [PR #2992](https://github.com/pgjdbc/pgjdbc/pull/2992) fixes [Issue #2991](https://github.com/pgjdbc/pgjdbc/issues/2991)
+* test: fix assertion in RefCursorFetchTestultFetchSize rows
+* test: use try-with-resources in LogicalReplicationStatusTest
+
+## [42.6.0] (2023-03-17 15:34:34 -0400)
+
+### Changed
+* fix: use PhantomReferences instead of `Obejct.finalize()` to track Connection leaks [PR #2847](https://github.com/pgjdbc/pgjdbc/pull/2847) 
+
+    The change replaces all uses of Object.finalize with PhantomReferences.
+    The leaked resources (Connections) are tracked in a helper thread that is active as long as
+    there are connections in use. By default, the thread keeps running for 30 seconds after all
+    the connections are released. The timeout is set with pgjdbc.config.cleanup.thread.ttl system property.
+
+* refactor:(loom) replace the usages of synchronized with ReentrantLock [PR #2635](https://github.com/pgjdbc/pgjdbc/pull/2635)
+    Fixes [Issue #1951](https://github.com/pgjdbc/pgjdbc/issues/1951)
+
+## [42.5.4] (2023-02-15 10:21:04 -0500)
+
+### Fixed
+* fix: fix testGetSQLTypeQueryCache by searching for xid type. We used to search for box type but it is now cached. xid is not cached, this nuance is required for the test.  
+* fix OidValueCorrectnessTest BOX_ARRAY OID, by adding BOX_ARRAY to the oidTypeName map [PR #2810]((https://github.com/pgjdbc/pgjdbc/pull/2810).
+* fixes [Issue #2804](https://github.com/pgjdbc/pgjdbc/issues/2804).  
+* fix: Make sure that github CI runs tests on all [PRs #2809]((https://github.com/pgjdbc/pgjdbc/pull/2809)).  
+
+## [42.5.3] (2023-02-03 08:24:50 -0500)
+
+### Fixed
+* fix: Add box to TypeInfoCache, fixes [Issue #2746](https://github.com/pgjdbc/pgjdbc/issues/2746) [PR #2747](https://github.com/pgjdbc/pgjdbc/pull/2747)  
+* fix: regression in PgResultSet LONG_MIN copy and paste error fixes [Issue #2748](https://github.com/pgjdbc/pgjdbc/issues/2748) [PR#2749](https://github.com/pgjdbc/pgjdbc/pull/2749)
+
+## [42.5.2] (2023-01-31 14:30:46 -0500)
+
+### Changed
+* regression: This release has 2 known regressions which make it unusable see the notes above. We advise people to use 42.5.3 instead.  
+* docs: specify that timeouts are in seconds and there is a maximum. Housekeeping on some tests fixes [#Issue 2671](https://github.com/pgjdbc/pgjdbc/issues/2671) [PR #2686](https://github.com/pgjdbc/pgjdbc/pull/2686)  
+* docs: clarify binaryTransfer and add it to README [PR# 2698](https://github.com/pgjdbc/pgjdbc/pull/2698)  
+* docs: Document the need to encode reserved characters in the connection URL [PR #2700](https://github.com/pgjdbc/pgjdbc/pull/2700)  
+* feat: Define binary transfer for custom types dynamically/automatically fixes [Issue #2554](https://github.com/pgjdbc/pgjdbc/issues/2554) [PR #2556](https://github.com/pgjdbc/pgjdbc/pull/2556)  
+
+### Added
+* fix: added gssResponseTimeout as part of [PR #2687](https://github.com/pgjdbc/pgjdbc/pull/2687) to make sure we don't wait forever on a GSS RESPONSE
+
+### Fixed
+* fix: Ensure case of XML tags in Maven snippet is correct [PR #2682](https://github.com/pgjdbc/pgjdbc/pull/2682)
+* fix: Make sure socket is closed if an exception is thrown in createSocket fixes [Issue #2684](https://github.com/pgjdbc/pgjdbc/issues/2684) [PR #2685](https://github.com/pgjdbc/pgjdbc/pull/2685)
+* fix: Apply patch from [Issue #2683](https://github.com/pgjdbc/pgjdbc/issues/2683) to fix hanging ssl connections [PR #2687](https://github.com/pgjdbc/pgjdbc/pull/2687)
+* fix - binary conversion of (very) long numeric values (longer than 4 * 2^15 digits) [PR #2697](https://github.com/pgjdbc/pgjdbc/pull/2697) fixes [Issue #2695](https://github.com/pgjdbc/pgjdbc/issues/2695)
+* minor: enhance readability connection of startup params [PR #2705](https://github.com/pgjdbc/pgjdbc/pull/2785)
+
+## [42.5.1] (2022-11-23 10:14:59 -0500)
+### Security
+- security: StreamWrapper spills to disk if setText, or setBytea sends very large Strings or arrays to the server. createTempFile creates a file which can be read by other users on unix like systems (Not macos).
+This has been fixed in this version fixes CVE-2022-41946 see the [security advisory](https://github.com/pgjdbc/pgjdbc/security/advisories/GHSA-562r-vg33-8x8h) for more details. Reported by [Jonathan Leitschuh](https://github.com/JLLeitschuh) This has been fixed in versions 42.5.1, 42.4.3 42.3.8, 42.2.27.jre7. Note there is no fix for 42.2.26.jre6. See the security advisory for work arounds.
+
+### Fixed
+
+- fix: make sure we select array_in from pg_catalog to avoid duplicate array_in functions fixes [#Issue 2548](https://github.com/pgjdbc/pgjdbc/issues/2548) [PR #2552](https://github.com/pgjdbc/pgjdbc/issues/2552)
+- fix: binary decoding of bool values [PR #2640](https://github.com/pgjdbc/pgjdbc/pull/2640)
+- perf: improve performance of PgResultSet getByte/getShort/getInt/getLong for float-typed columns [PR #2634](https://github.com/pgjdbc/pgjdbc/pull/2634)
+- chore: fix various spelling errors [PR #2592](https://github.com/pgjdbc/pgjdbc/pull/2592)
+- chore: Feature/urlparser improve URLParser [PR #2641](https://github.com/pgjdbc/pgjdbc/pull/2592)
+
+## [42.5.0] (2022-08-23 11:20:11 -0400)
+### Changed
+- fix: revert change in [PR #1986](https://github.com/pgjdbc/pgjdbc/pull/1986) where float was aliased to float4 from float8. 
+float now aliases to float8 [PR #2598](https://github.com/pgjdbc/pgjdbc/pull/2598) fixes [Issue #2597](https://github.com/pgjdbc/pgjdbc/issues/2597) 
+
+## [42.4.2] (2022-08-17 10:33:40 -0400)
+### Changed
+- fix: add alias to the generated getUDT() query for clarity (PR #2553)[https://github.com/pgjdbc/pgjdbc/pull/2553] 
+
+### Added
+- fix: make setObject accept UUID array [PR #2587](https://github.com/pgjdbc/pgjdbc/pull/2587)
+
+### Fixed
+- fix: regression with GSS. Changes introduced to support building with Java 17 caused failures [Issue #2588](https://github.com/pgjdbc/pgjdbc/issues/2588)
+- fix: set a timeout to get the return from requesting SSL upgrade. [PR #2572](https://github.com/pgjdbc/pgjdbc/pull/2572)
+- feat: synchronize statement executions (e.g. avoid deadlock when Connection.isValid is executed from concurrent threads)
+
+## [42.4.1] (2022-08-01 16:24:20 -0400)
+### Security
+- fix: CVE-2022-31197 Fixes SQL generated in PgResultSet.refresh() to escape column identifiers so as to prevent SQL injection.
+  - Previously, the column names for both key and data columns in the table were copied as-is into the generated
+  SQL. This allowed a malicious table with column names that include statement terminator to be parsed and
+  executed as multiple separate commands.
+  - Also adds a new test class ResultSetRefreshTest to verify this change.
+  - Reported by [Sho Kato](https://github.com/kato-sho)
+
+### Changed
+- chore: skip publishing pgjdbc-osgi-test to Central
+- chore: bump Gradle to 7.5
+- test: update JUnit to 5.8.2
+
+### Added
+- chore: added Gradle Wrapper Validation for verifying gradle-wrapper.jar
+- chore: added "permissions: contents: read" for GitHub Actions to avoid unintentional modifications by the CI
+- chore: support building pgjdbc with Java 17
+- feat: synchronize statement executions (e.g. avoid deadlock when Connection.isValid is executed from concurrent threads)
+
+
+## [42.4.0] (2022-06-09 08:14:02 -0400)
+### Changed
+- fix: added GROUP_STARTUP_PARAMETERS boolean property to determine whether or not to group 
+startup parameters in a transaction (default=false like 42.2.x) fixes [Issue #2425](https://github.com/pgjdbc/pgjdbc/issues/2497) 
+pgbouncer cannot deal with transactions in statement pooling mode [PR #2425](https://github.com/pgjdbc/pgjdbc/pull/2425)
+
+### Fixed
+- fix: queries with up to 65535 (inclusive) parameters are supported now (previous limit was 32767) 
+[PR #2525](https://github.com/pgjdbc/pgjdbc/pull/2525), [Issue #1311](https://github.com/pgjdbc/pgjdbc/issues/1311)
+- fix: workaround JarIndex parsing issue by using groupId/artifactId-version directory namings. 
+Regression since 42.2.13. [PR #2531](https://github.com/pgjdbc/pgjdbc/pull/2531), [issue #2527](https://github.com/pgjdbc/pgjdbc/issues/2527)
+- fix: use Locale.ROOT for toUpperCase() toLowerCase() calls
+- doc: add Vladimir Sitnikov's PGP key
+- fix: return correct base type for domain from getUDTs [PR #2520](https://github.com/pgjdbc/pgjdbc/pull/2520) [Issue #2522](https://github.com/pgjdbc/pgjdbc/issues/2522)
+- perf: utcTz static and renamed to UTC_TIMEZONE [PR #2519](https://github.com/pgjdbc/pgjdbc/pull/2520)
+- doc: fix release version for #2377 (it should be 42.3.6, not 42.3.5)
+
+## [42.3.6] (2022-05-24 08:52:27 -0400)
+### Changed
+
+### Added
+
+### Fixed
+- fix: close refcursors when underlying cursor==null instead of relying on defaultRowFetchSize [PR #2377](https://github.com/pgjdbc/pgjdbc/pull/2377)
+
+## [42.3.5] (2022-05-04 08:48:35 -0400)
+### Changed
+- test: polish TimestampUtilsTest
+- chore: use GitHub Action concurrency feature to terminate CI jobs on fast PR pushes
+
+### Added
+- Added KEYS file to allow for verifying artifacts [PR 2499](https://github.com/pgjdbc/pgjdbc/pull/2499)
+
+### Fixed
+- perf: enable tcpNoDelay by default [PR 2495](https://github.com/pgjdbc/pgjdbc/pull/2495).
+ This is a regression from 42.2.x versions where tcpNoDelay defaulted to true
+- docs: fix readme.md after [PR 2495](https://github.com/pgjdbc/pgjdbc/pull/2495) [PR 2496](https://github.com/pgjdbc/pgjdbc/pull/249)
+- feat: targetServerType=preferPrimary connection parameter [PR 2483](https://github.com/pgjdbc/pgjdbc/pull/2483)
+- fix: revert removal of toOffsetDateTime(String timestamp)  fixes [Issue #2497](https://github.com/pgjdbc/pgjdbc/issues/2497) [PR 2501](https://github.com/pgjdbc/pgjdbc/pull/2501)
+  
+## [42.3.4] (2022-04-01 14:16:28 -0400)
+### Changed
+- fix: change name of build cache [PR 2471](https://github.com/pgjdbc/pgjdbc/pull/2471)
+- feat: add support for ResultSet#getObject(OffsetTime.class) and PreparedStatement#setObject(OffsetTime.class) [PR 2467](https://github.com/pgjdbc/pgjdbc/pull/2467)
+- fix: Use non-synchronized getTimeZone in TimestampUtils [PR 2451](https://github.com/pgjdbc/pgjdbc/pull/2451)
+- docs: Fix CHANGELOG.md misformatted markdown headings [PR 2461](https://github.com/pgjdbc/pgjdbc/pull/2461)
+- docs:  remove loggerLevel and loggerFile from docs and issues [PR 2489](https://github.com/pgjdbc/pgjdbc/pull/2489)
+- feat: use direct wire format -> LocalDate conversion without resorting to java.util.Date, java.util.Calendar, 
+  and default timezones [PR 2464](https://github.com/pgjdbc/pgjdbc/pull/2464) fixes Issue #2221
+
+### Added
+
+### Fixed
+- docs: Update testing documentation [PR 2446](https://github.com/pgjdbc/pgjdbc/pull/2446)
+- fix: Throw an exception if the driver cannot parse the URL instead of returning NULL fixes [Issue #2421](https://github.com/pgjdbc/pgjdbc/issues/2421)  [PR 2441](https://github.com/pgjdbc/pgjdbc/pull/2441) 
+- fix: Use PGProperty instead of the property names directly [PR 2444](https://github.com/pgjdbc/pgjdbc/pull/2444)
+- docs: update changelog, missing links at bottom and formatting [PR 2460](https://github.com/pgjdbc/pgjdbc/pull/2460)
+- fix: Remove isDeprecated from PGProperty. It was originally intended to help produce automated docs. Fixes Issue #2479 [PR 2480](https://github.com/pgjdbc/pgjdbc/pull/2480)
+- fix: change PGInterval parseISO8601Format to support fractional second [PR 2457](https://github.com/pgjdbc/pgjdbc/pull/2457)
+- fix: GSS login to use TGT from keytab fixes Issue #2469 [PR 2470](https://github.com/pgjdbc/pgjdbc/pull/2470) 
+- fix: More test and fix for issues discovered by [PR #2476](https://github.com/pgjdbc/pgjdbc/pull/2476) [PR #2488](https://github.com/pgjdbc/pgjdbc/pull/2488)
+
+## [42.3.3] (2022-02-15 11:32:24 -0500)
+### Changed
+- fix: Removed loggerFile and loggerLevel configuration. While the properties still exist. 
+  They can no longer be used to configure the driver logging. Instead use java.util.logging
+  configuration mechanisms such as `logging.properties`. 
+
+### Added
+
+### Fixed
+
+## [42.3.2] (2022-02-01 07:35:41 -0500)
+### Security
+- CVE-2022-21724 pgjdbc instantiates plugin instances based on class names provided via authenticationPluginClassName, 
+sslhostnameverifier, socketFactory, sslfactory, sslpasswordcallback connection properties.
+However, the driver did not verify if the class implements the expected interface before instantiating the class. This
+would allow a malicious class to be instantiated that could execute arbitrary code from the JVM. Fixed in [commit](https://github.com/pgjdbc/pgjdbc/commit/f4d0ed69c0b3aae8531d83d6af4c57f22312c813)
+
+### Changed
+- perf: read in_hot_standby GUC on connection [PR #2334](https://github.com/pgjdbc/pgjdbc/pull/2334)
+- test: materialized view privileges [PR #2209](https://github.com/pgjdbc/pgjdbc/pull/2209) fixes [Issue #2060](https://github.com/pgjdbc/pgjdbc/issues/2060)
+- docs: add info about convenience maven project [PR #2407](https://github.com/pgjdbc/pgjdbc/pull/2407)
+- docs: Document timezone reversal from POSIX to ISO [PR #2413](https://github.com/pgjdbc/pgjdbc/pull/2413)
+- fix: we will ask the server if it supports GSS Encryption if gssEncryption 
+is prefer or require [PR #2396](https://github.com/pgjdbc/pgjdbc/pull/2396) remove the need to have a ticket in the cache before asking the server if gss encryptions are supported
+- docs: remove Java 6 and 7 references from contributing [PR #2385](https://github.com/pgjdbc/pgjdbc/pull/2385)
+- style: remove Java 8 / JDBC 4.2 checks [PR #2383](https://github.com/pgjdbc/pgjdbc/pull/2383) Remove all remaining checks whether the source is lower than Java 8
+or JDBC 4.2.
+- fix: throw SQLException for #getBoolean BIT(>1) [PR #2386](https://github.com/pgjdbc/pgjdbc/pull/2386) Throw SQLException instead of ClassCastException when calling
+CallableStatement#getBoolean(int) on BIT(>1).
+- style: import java.time types in more classes [PR #2382](https://github.com/pgjdbc/pgjdbc/pull/2382) Use imports for java.time types in all remaining classes.
+- style: import java.time types in TimestampUtils [PR #2380](https://github.com/pgjdbc/pgjdbc/pull/2380) Use imports for java.time types in TimestampUtils.
+- refactor: Change internal constructors to pass only connection Properties
+Changes internal constructors for PgConnection and related classes to only accept the connection properties object and 
+remove the user and password arguments. Any locations that required those fields can retrieve them from the properties map.
+- test: Fix DatabaseMetadataTest to perform mview tests only on 9.3+
+- perf: read in_hot_standby GUC on connection [PR #2334](https://github.com/pgjdbc/pgjdbc/pull/2334)
+- doc: improv doc around binary decoding of numeric data [#2331](https://github.com/pgjdbc/pgjdbc/pull/2331)
+- Add cert key type checking to chooseClientAlias [PR #2417](https://github.com/pgjdbc/pgjdbc/pull/2417)
+
+### Added
+- feat: Add authenticationPluginClassName option to provide passwords at runtime
+Adds authenticationPluginClassName connection property that allows end users to specify a class
+that will provide the connection passwords at runtime. Users implementing that interface must
+ensure that each invocation of the method provides a new char[] array as the contents
+will be filled with zeroes by the driver after use.Call sites within the driver have been updated to use the char[] directly wherever possible.
+This includes direct usage in the GSS authentication code paths that internally were already converting the String password into a char[] for internal usage.
+This allows configuring a connection with a password that must be generated on the fly or periodically changes. [PR #2369](https://github.com/pgjdbc/pgjdbc/pull/2369) original issue [Issue #2102](https://github.com/pgjdbc/pgjdbc/issues/2102)
+- feat: add tcpNoDelay option [PR #2341](https://github.com/pgjdbc/pgjdbc/pull/2341) fixes [Issue #2324](https://github.com/pgjdbc/pgjdbc/issues/2324)
+- feat: pg_service.conf and .pgpass support (jdbc:postgresql://?service=my-service) [PR #2260](https://github.com/pgjdbc/pgjdbc/pull/2260) fixes [Issue #2278](https://github.com/pgjdbc/pgjdbc/issues/2278)
+
+### Fixed
+- Use local TimestampUtil in PgStatement and PgResultset for thread safety [PR #2291](https://github.com/pgjdbc/pgjdbc/pull/2291)
+  fixes [Issue #921](https://github.com/pgjdbc/pgjdbc/issues/921) synchronize modification of shared calendar
+- fix: PgObject isNull() was reporting the opposite fixes [Issue #2411](https://github.com/pgjdbc/pgjdbc/issues/2411) [PR #2414](https://github.com/pgjdbc/pgjdbc/pull/2414)
+- fix: default file name is ".pg_service.conf" on Windows (not "pg_service.conf") [PR #2398](https://github.com/pgjdbc/pgjdbc/pull/2398) fixes [Issue #2278](https://github.com/pgjdbc/pgjdbc/issues/2278)
+- test: Fix RefCursorFetchTest on older platforms
+- fix: do not close refcursor after reading if fetchsize has been set fixes [Issue #2227](https://github.com/pgjdbc/pgjdbc/issues/2227) [PR #2371](https://github.com/pgjdbc/pgjdbc/pull/2371)
+- fix: rework gss authentication to use the principal name to get the credentials fixes [Issue #2235](https://github.com/pgjdbc/pgjdbc/issues/2235) [PR #2352](https://github.com/pgjdbc/pgjdbc/pull/2352)
+- fix: return getIndexInfo metadata columns in UPPER CASE [PR #2368](https://github.com/pgjdbc/pgjdbc/pull/2368)
+- fix: Connection leak in ConnectionFactoryImpl#tryConnect [PR #2350](https://github.com/pgjdbc/pgjdbc/pull/2350) [Issue #2351](https://github.com/pgjdbc/pgjdbc/issues/2351)
+- fix: Fix For IS_AUTOGENERATED Flag [PR #2348](https://github.com/pgjdbc/pgjdbc/pull/2348)
+- fix: parsing service file tests for windows [PR #2347](https://github.com/pgjdbc/pgjdbc/pull/2347)
+- fix: The spec says that calling close() on a closed connection is a noop. [PR #2345](https://github.com/pgjdbc/pgjdbc/pull/2345) fixes [Issue #2300](https://github.com/pgjdbc/pgjdbc/issues/2300)
+- fix: add microsecond precision to getTimestamp() called on sql TIME(6) Currently, "when fetching a value of type TIME(6) through
+resultSet.getTimestamp() only ms precision is retained, the microsecond fractional digits are lost." This change will retain the microsecond
+precision when .getTimestamp() is called on TIME(6). [PR #2181](https://github.com/pgjdbc/pgjdbc/pull/2181) Closes [Issue #1537](https://github.com/pgjdbc/pgjdbc/issues/1537)
+- test: materialized view privileges [PR #2209](https://github.com/pgjdbc/pgjdbc/pull/2209) add and drop a materialized view
+Add to TestUtil and also to DatabaseMetaData setup and teardown fixes [Issue #2060](https://github.com/pgjdbc/pgjdbc/issues/2060)
+- fix: typo in connect.md [PR #2338](https://github.com/pgjdbc/pgjdbc/pull/2238) `OutOfMemoryException` => `OutOfMemoryError`
+- fix: use local TimestampUtil in PgStatement and PgResultset for thread
+safety TimestampUtil is not thread safe. It raises exceptions when multiple threads use ResultSets of one connection. [PR #2291](https://github.com/pgjdbc/pgjdbc/pull/2291) 
+fixes [Issue #921](https://github.com/pgjdbc/pgjdbc/issues/921)
+If PgStatement and PgResultSet use their own TimestampUtil no synchronize is needed.
+- fix: typo in CONTRIBUTING.md [PR #2332](https://github.com/pgjdbc/pgjdbc/pull/2332) seccion => section
+## [42.3.1] (2021-10-29)
+### Changed
+- improv: Arrays in Object[] [PR 2330](https://github.com/pgjdbc/pgjdbc/pull/2330) when an Object[] contains other arrays, treat as though it were a
+multi-dimensional array the one exception is byte[], which is not supported.
+- improv: Use jre utf-8 decoding [PR 2317](https://github.com/pgjdbc/pgjdbc/pull/2317) Remove use of custom utf-8 decoding.
+- perf: improve performance of bytea string decoding [PR 2320](https://github.com/pgjdbc/pgjdbc/pull/2320)
+improve the parsing of bytea hex encoded string by making a lookup table for each of the valid ascii code points to the 4 bit numeric value
+- feat: intern/canonicalize common strings [PR 2234](https://github.com/pgjdbc/pgjdbc/pull/2234)
+### Added
+
+### Fixed
+- numeric binary decode for even 10 thousands [PR #2327](https://github.com/pgjdbc/pgjdbc/pull/2327) fixes  [Issue 2326](https://github.com/pgjdbc/pgjdbc/issues/2326)
+binary numeric values which represented integers multiples of 10,000 from 10,000-9,990,000 were not decoded correctly
+- [typo] typo in certdir/README.md [PR #2309](https://github.com/pgjdbc/pgjdbc/pull/2309) certificatess => certificates
+- [typo] typo in TimestampUtils.java [PR #2314](https://github.com/pgjdbc/pgjdbc/pull/2314) Change `Greagorian` to `Gregorian`.
+- remove check for negative pid in cancel request. Apparently pgbouncer can send one fixes [Issue 2317](https://github.com/pgjdbc/pgjdbc/issues/2317) [PR #2319](https://github.com/pgjdbc/pgjdbc/pull/2319)
+
+## [42.3.0] (2021-10-18)
+### Changed
+- No longer build for Java 6 or Java 7
+- If assumeMinServerVersion is not defined and server is at least 9.0, group startup statements into a single transaction PR [#1977](https://github.com/pgjdbc/pgjdbc/pull/1977)
+
+### Added
+- Support for pg_service.conf file and jdbc URL syntax: "jdbc:postgresql://?service=service1".
+  Resource can be provided using 1) property "-Dorg.postgresql.pgservicefile=file1" 2) environment variable PGSERVICEFILE=file2 3) default location "$HOME/.pg_service.conf" 4) environment variable PGSYSCONFDIR=dir1 looks for file "dir1/pg_service.conf".
+- Support for .pgpass file. Resource can be provided using 1) property "-Dorg.postgresql.pgpassfile=file1" 2) environment variable PGPASSFILE=file2 3) default location "$HOME/.pgpass"
+
+### Fixed
+- Rework OSGi bundle activator so it does not rely on exception message to check DataSourceFactory presence PR [#507](https://github.com/pgjdbc/pgjdbc/pull/507)
+- Fix database metadata getFunctions() and getProcedures() to ignore search_path when no schema pattern is specified [PR #2174](https://github.com/pgjdbc/pgjdbc/pull/2174)
+- Fix refreshRow made the row readOnly. [PR #2195](https://github.com/pgjdbc/pgjdbc/pull/2195 Fixes [Issue #2193](https://github.com/pgjdbc/pgjdbc/issues/2193)
+- Fix do not add double quotes to identifiers already double quoted [PR #2224](https://github.com/pgjdbc/pgjdbc/pull/2224) Fixes [Issue #2223](https://github.com/pgjdbc/pgjdbc/issues/2223)
+  Add a property `QUOTE_RETURNING_IDENTIFIERS` which determines if we put double quotes
+  around identifiers that are provided in the returning array.
+- Fix Provide useful error message for empty or missing passwords for SCRAM auth [PR #2290](https://github.com/pgjdbc/pgjdbc/pull/2290) fixes [Issue #2288](https://github.com/pgjdbc/pgjdbc/issues/2288)
+
+## [42.2.24] (2021-09-23)
+### Fixed
+- Fix startup regressions caused by [PR #1949](https://github.com/pgjdbc/pgjdbc/pull/1949). Instead of checking all types by OID, we can return types for well known types [PR #2257](https://github.com/pgjdbc/pgjdbc/pull/2257)
+- Backport [PR #2148](https://github.com/pgjdbc/pgjdbc/pull/2148)
+  Avoid leaking server error details through BatchUpdateException when logServerErrorDetail [PR #2254](https://github.com/pgjdbc/pgjdbc/pull/2254)
+- Backpatch [PR #2247](https://github.com/pgjdbc/pgjdbc/pull/2247)
+  QueryExecutorImpl.receiveFastpathResult did not properly handle ParameterStatus messages.
+  This in turn caused failures for some LargeObjectManager operations. Closes [Issue #2237](https://github.com/pgjdbc/pgjdbc/issues/2237)
+  Fixed by adding the missing code path, based on the existing handling in processResults. [PR #2253](https://github.com/pgjdbc/pgjdbc/pull/2253)
+- Backpatch [PR #2242](https://github.com/pgjdbc/pgjdbc/pull/2242) PgDatabaseMetaData.getIndexInfo() cast operands to smallint  [PR#2253](https://github.com/pgjdbc/pgjdbc/pull/2253)
+  It is possible to break method PgDatabaseMetaData.getIndexInfo() by adding certain custom operators. This PR fixes it.
+- Backpatching [PR #2251](https://github.com/pgjdbc/pgjdbc/pull/2251) into 42.2 Clean up open connections to fix test failures on omni and appveyor
+  use older syntax for COMMENT ON FUNCTION with explicit no-arg parameter parentheses as it is required on server versions before v10.
+  Handle cleanup of connection creation in StatementTest, handle cleanup of privileged connection in DatabaseMetaDataTest
+- Backpatch [PR #2245](https://github.com/pgjdbc/pgjdbc/pull/2245) fixes case where duplicate tables are returned if there are duplicate descriptions oids are not guaranteed to be unique in the catalog [PR #2248](https://github.com/pgjdbc/pgjdbc/pull/2248)
+- Change to updatable result set to use correctly primary or unique keys [PR #2228](https://github.com/pgjdbc/pgjdbc/pull/2228)
+    fixes issues introduced in [PR #2199](https://github.com/pgjdbc/pgjdbc/pull/2199) closes [Issue #2196](https://github.com/pgjdbc/pgjdbc/issues/2196)
+- Fix NPE calling getTypeInfo when alias is null [PR #2220](https://github.com/pgjdbc/pgjdbc/pull/2220)
+- Backpatch [PR #2217](https://github.com/pgjdbc/pgjdbc/pull/2217) to fix [Issue #2215](https://github.com/pgjdbc/pgjdbc/issues/2215). OIDs are unsigned integers and were not being handled correctly when they exceeded the size of signed integers
+
+
+## [42.2.23] (2021-07-06)
+### Changed
+- Renewed the SSL keys for testing
+
+### Fixed
+- getColumnPrecision for Numeric when scale and precision not specified now returns 0 instead of 131089 fixes: Issue #2188
+- Calling refreshRow on an updateable resultset made the row readOnly. Fixes Issue #2193
+- results should be updateable if there is a unique index available PR#2199 Fixes Issue #2196
+- Rework sql type gathering to use OID instead of typname.
+  This does not have the issue of name shadowing / qual-names, and has the added benefit of fixing #1948.
+
+
+## [42.2.22] (2021-06-16)
+### Fixed
+- Regression caused by https://github.com/pgjdbc/pgjdbc/commit/4fa2d5bc1ed8c0086a3a197fc1c28f7173d53cac. Unfortunately
+  due to the blocking nature of the driver and issues with seeing if there is a byte available on a blocking stream when it is encrypted
+  this introduces unacceptable delays in returning from peek(). At this time there is no simple solution to this.
+
+
+## [42.2.21] (2021-06-10)
+### Changed
+- Update docs to reflect deprecated DataSource API setServerName backpatch [PR#2057](https://github.com/pgjdbc/pgjdbc/pull/2057) [PR #2105](https://github.com/pgjdbc/pgjdbc/pull/2105)
+
+### Fixed
+- make sure the table has defined primary keys when using updateable resultset backpatch [PR#2101](https://github.com/pgjdbc/pgjdbc/pull/2101) fixes [Issue 1975](https://github.com/pgjdbc/pgjdbc/issues/1975) [PR #2106](https://github.com/pgjdbc/pgjdbc/pull/2106)
+- backpatch [PR #2143](https://github.com/pgjdbc/pgjdbc/pull/2143) read notifies or errors that come in asynchronously after the ready for query [PR #2168](https://github.com/pgjdbc/pgjdbc/pull/2168)
+- backpatch [PR #507](https://github.com/pgjdbc/pgjdbc/pull/507) which reworks OSGI bundle activator fixes [ISSUE #2133](https://github.com/pgjdbc/pgjdbc/issues/2133)
+- Fix database metadata getFunctions() and getProcedures() to ignore search_path when no schema pattern is specified. backpatch [PR #2174](https://github.com/pgjdbc/pgjdbc/pull/2174)
+  fixes [Issue 2173](https://github.com/pgjdbc/pgjdbc/issues/2173)
+
+
+## [42.2.20] (2021-04-19)
+### Fixed
+- Partitioned indexes were not found fixes [#2078](https://github.com/pgjdbc/pgjdbc/issues/2078) PR [#2087](https://github.com/pgjdbc/pgjdbc/pull/2087)
+- isValid() timeout should not be blocked [#1943](https://github.com/pgjdbc/pgjdbc/pull/1943) Cherry-picked [#2076](https://github.com/pgjdbc/pgjdbc/pull/2076)
+  The usage of `setQueryTimeout();` with the same value as the `setNetworkTimeout();` is blocking the current transaction timeout.
+  The timeouts are blocking each other with this approach.
+- DatabaseMetaData.getTables returns columns in UPPER case as per the spec [PR #2092](https://github.com/pgjdbc/pgjdbc/pull/2092) fixes [Issue #830](https://github.com/pgjdbc/pgjdbc/issues/830)
+
+
+## [42.2.19] (2021-02-18)
+**Notable Changes**
+- Now the driver uses SASLprep normalization for SCRAM authentication fixing some issues with spaces in passwords.
+- If closeOnCompletion is called on an existing statement and the statement is executed a second time it will fail.
+
+### Changed
+- Perf: avoid duplicate PGStream#changeSocket calls
+- Fix: Actually close unclosed results. Previously was not closing the first unclosed result fixes #1903 (#1905).
+There is a small behaviour change here as a result. If closeOnCompletion is called on an existing statement and the statement
+is executed a second time it will fail.
+
+### Added
+- Verify code via forbidden-apis (jdk-internal and jdk-non-portable signatures) [PR #2012](https://github.com/pgjdbc/pgjdbc/pull/2012)
+
+### Fixed
+- Fix Binary transfer for numeric fixes #1935
+- Fix Allow specifying binaryTransferEnable even for those types that are not enabled by default
+- Fix: properly set cancel socket timeout (#2044)
+- Fix "Required class information missing" when old org.jboss:jandex parses pgjdbc classes [issue 2008][https://github.com/pgjdbc/pgjdbc/issues/2008]
+- Fix PGCopyInputStream returning the last row twice when reading with CopyOut API [issue 2016][https://github.com/pgjdbc/pgjdbc/issues/2016]
+- Fix Connection.isValid() to not wait longer than existing network timeout [PR #2040](https://github.com/pgjdbc/pgjdbc/pull/2040)
+- Fix Passwords with spaces (ASCII and non-ASCII) now work with SCRAM authentication (driver now uses SASLprep normalization) [PR #2052](https://github.com/pgjdbc/pgjdbc/pull/2052)
+- Fix DatabaseMetaData.getTablePrivileges() to include views, materialized views, and foreign tables [PR #2049](https://github.com/pgjdbc/pgjdbc/pull/2049)
+- Fix Resolve ParseError in PGtokenizer fixes #2050
+- Fix return metadata privileges for views and foreign tables
+
+
+## [42.2.18] (2020-10-15)
+### Fixed
+- Unfortunately changing the default of gssEncMode to ALLOW was not enough. The GSSEncMode Enum was not changed as well
+fixed in #1920
+
+
+## [42.2.17] (2020-10-09)
+### Changed
+- Change default of gssEncMode to ALLOW. PostgreSQL can deal with PREFER but there are cloud providers that did not implement the protocol properly. Libpq gets around this by checking for a GSS credential cache before attempting the connection. This is possible in JDK 8 and up, but not JDK6, or JDK7 fixes Issue #1868 [PR #1913](https://github.com/pgjdbc/pgjdbc/pull/1913)
+
+### Added
+- Add smallserial metadata [PR #899(https://github.com/pgjdbc/pgjdbc/pull/899)
+
+### Fixed
+- Avoid NullPointerException when receiving PGbox, PGcircle, PGline, PGlseg, PGpath, PGpoint, PGpolygon, and PGmoney [PR 1873] (https://github.com/pgjdbc/pgjdbc/pull/1873).
+- The driver returns enum and jsonb arrays elements as String objects (like in 42.2.14 and earlier versions) [PR 1879](https://github.com/pgjdbc/pgjdbc/pull/1879).
+- PgTokenizer was ignoring last empty token [PR #1882](https://github.com/pgjdbc/pgjdbc/pull/1882)
+- Remove osgi from karaf fixes Issue #1891 [PR #1902](https://github.com/pgjdbc/pgjdbc/pull/1902)
+- Handle nulls when the following classes are used: PGbox, PGcircle, PGline, PGlseg, PGpath, PGpoint, PGpolygon, and PGmoney.
+
+## [42.2.16] (2020-08-20)
+### Known issues
+- The driver returns enum and jsonb arrays elements are returned as PGobject instances (fixed in 42.2.17)
+
+### Fixed
+- Arrays sent in binary format are now sent as 1 based. This was a regression for multi-dimensional arrays as well as text/varchar, oid and bytea arrays.
+  Since 42.2.0 single dimensional arrays were stored 0 based. They are now sent 1 based which is the SQL standard, and the default
+  for Postgres when sent as strings such as '{1,2,3}'. Fixes [issue 1860](https://github.com/pgjdbc/pgjdbc/issues/1860) in [PR 1863](https://github.com/pgjdbc/pgjdbc/pull/1863).
+
+## [42.2.15] (2020-08-14)
+### Known issues
+- The driver returns enum and jsonb arrays elements are returned as PGobject instances (fixed in 42.2.17)
+
+### Changed
+- Rename source distribution archive to `postgresql-$version-jdbc-src.tar.gz`, and add top-level archive folder [ba017507](https://github.com/pgjdbc/pgjdbc/commit/ba0175072ee9c751c1496d2fe170f4af7256f1a5)
+- Add the ability to connect with a GSSAPI encrypted connection. As of PostgreSQL version 12 GSSAPI encrypted connections
+are possible. Now the driver will attempt to connect to the server with a GSSAPI encrypted connection. If that fails then
+attempt an SSL connection, finally falling back to a plain text connection. All of this is controlled using both the gssEncMode
+and sslMode parameters which, in concert with pg_hba.conf, determine if a particular mode is allowed and or required. [PR 1821](https://github.com/pgjdbc/pgjdbc/pull/1821) [ad921b9e](https://github.com/pgjdbc/pgjdbc/commit/ad921b9e3563b28b9a03b1e2dfaad0e34efc02f1)
+- Source release archive shades dependencies (scram) by default. It affects only postgresql-version-src.tar.gz release artifact [f0301eb9](https://github.com/pgjdbc/pgjdbc/commit/f0301eb901f880059b00b0fb0a3ee93ef7d749a8)
+- Refactor decoding arrays [PR 1194](https://github.com/pgjdbc/pgjdbc/pull/1194)
+
+### Added
+- Verify nullness with CheckerFramework [6e524ae5](https://github.com/pgjdbc/pgjdbc/commit/6e524ae51cee67b25426c09a7083465c820c0a0d)
+
+### Fixed
+- Avoid preparedStatement leak when using updateable ResultSet via insert/update/refreshRow [PR 1815](https://github.com/pgjdbc/pgjdbc/pull/1815) [9a0d2b18](https://github.com/pgjdbc/pgjdbc/commit/9a0d2b18a81c7ec5974d4caf2ff2d218312da25f)
+- Change order of checks for oid vs primary keys. OID's have been deprecated. [PR 1613](https://github.com/pgjdbc/pgjdbc/pull/1613)
+- Close certificate file stream. [PR 1837](https://github.com/pgjdbc/pgjdbc/pull/1837)
+- Make sure socketTimeout is enforced [PR 1831](https://github.com/pgjdbc/pgjdbc/pull/1831)
+- Assume PKCS-8 SSL key format by default [PR 1819](https://github.com/pgjdbc/pgjdbc/pull/1819)
+- Preserve unquoted unicode whitespace in array literals [PR 1266](https://github.com/pgjdbc/pgjdbc/pull/1266)
+
+## [42.2.14] (2020-06-10)
+### Changed
+- Reverted com.github.waffle:waffle-jna, org.osgi:org.osgi.core, org.osgi:org.osgi.enterprise dependencies to optional=true in Maven [PR 1797](https://github.com/pgjdbc/pgjdbc/pull/1797).
+
+## [42.2.13] (2020-06-04)
+
+**Notable Changes**
+
+- Security: The primary reason to release this version and to continue the 42.2.x branch is for CVE-2020-13692.
+Reported by David Dworken, this is an XXE and more information can be found [here](https://cheatsheetseries.owasp.org/cheatsheets/XML_External_Entity_Prevention_Cheat_Sheet.html).
+Sehrope Sarkuni reworked the XML parsing to provide a solution in commit [14b62aca4](https://github.com/pgjdbc/pgjdbc/commit/14b62aca4764d496813f55a43d050b017e01eb65).
+- The build system has been changed to Gradle thanks to Vladimir [PR 1627](https://github.com/pgjdbc/pgjdbc/pull/1627).
+- Regression: com.github.waffle:waffle-jna, org.osgi:org.osgi.core, org.osgi:org.osgi.enterprise dependencies are listed as non-optional [issue 1975](https://github.com/pgjdbc/pgjdbc/issues/1795).
+
+### Changed
+
+### Added
+- jre-6 was added back to allow us to release fixes for all artifacts in the 42.2.x branch [PR 1787](https://github.com/pgjdbc/pgjdbc/pull/1787)
+
+### Fixed
+- I/O error ru translation [PR 1756](https://github.com/pgjdbc/pgjdbc/pull/1756)
+- Issue [1771](https://github.com/pgjdbc/pgjdbc/issues/1771)  PgDatabaseMetaData.getFunctions() returns
+ procedures fixed in [PR 1774](https://github.com/pgjdbc/pgjdbc/pull/1774)
+- getTypeMap() returning null [PR 1781](https://github.com/pgjdbc/pgjdbc/pull/1774)
+- Updated openssl example command [PR 1763](https://github.com/pgjdbc/pgjdbc/pull/1763)
+- fix documentation with ordered list to be displayed correctly [PR 1783](https://github.com/pgjdbc/pgjdbc/pull/1783)
+
+## [42.2.12] (2020-03-31)
+
+**Notable changes**
+
+We have released 42.2.12 to correct regressions in this version: Specifically
+- [PR 1729](https://github.com/pgjdbc/pgjdbc/pull/1729) was reverted as this is a breaking change
+- [PR 1719](https://github.com/pgjdbc/pgjdbc/pull/1719) has been reverted as it introduced errors in the PgType Cache
+
+We recommend that version 42.2.11 not be used.
+### Changed
+ - reverted [PR 1729](https://github.com/pgjdbc/pgjdbc/pull/1729)  throw an error instead of silently rolling back a commit error. 
+ This change introduced a breaking change which will be moved to 42.3.0
+ - reverted [PR 1719](https://github.com/pgjdbc/pgjdbc/pull/1719)  add support for full names of data types (#1719)
+
+
+## [42.2.11] (2020-03-07)
+
+**Notable changes**
+As mentioned above this version is broken and should not be used.
+### Changed
+ - Reverted [PR 1641](https://github.com/pgjdbc/pgjdbc/pull/1252). The driver will now wait for EOF when sending cancel signals. 
+ - `DatabaseMetaData#getProcedures` returns only procedures (not functions) for PostgreSQL 11+ [PR 1723](https://github.com/pgjdbc/pgjdbc/pull/1723)
+ - Convert silent rollbacks into exception if application sends `commit` or `xa.prepare` command [PR 1729](https://github.com/pgjdbc/pgjdbc/pull/1729)
+
+### Added
+ - feat: `raiseExceptionOnSilentRollback` connection option to configure if silent rollback should raise an exception [PR 1729](https://github.com/pgjdbc/pgjdbc/pull/1729)
+ - feat: Expose `ByteStreamWriter` in CopyManager [PR 1702](https://github.com/pgjdbc/pgjdbc/pull/1702)
+ - feat: add way to distinguish base and partitioned tables in PgDatabaseMetaData.getTables [PR 1708](https://github.com/pgjdbc/pgjdbc/pull/1708)
+ - refactor: introduce tuple abstraction (rebased) [PR 1701](https://github.com/pgjdbc/pgjdbc/pull/1701)
+ - refactor: make PSQLState enum consts for integrity constraint violations [PR 1699](https://github.com/pgjdbc/pgjdbc/pull/1699)
+ - test: add makefile to create ssl certs [PR 1706](https://github.com/pgjdbc/pgjdbc/pull/1706)
+
+### Fixed
+ - fix: Always use `.` as decimal separator in PGInterval [PR 1705](https://github.com/pgjdbc/pgjdbc/pull/1705)
+ - fix: allow DatabaseMetaData.getColumns to describe an unset scale [PR 1716](https://github.com/pgjdbc/pgjdbc/pull/1716)
+
+### Changed
+ - Build system update from Maven to Gradle [PR 1627](https://github.com/pgjdbc/pgjdbc/pull/1627)
+
+### Added
+ - docker-compose image for creating test databases (see `docker` folder)
+
+## [42.2.10] (2020-01-30)
+### Changed
+ - (!) Regression: remove receiving EOF from backend after cancel [PR 1641](https://github.com/pgjdbc/pgjdbc/pull/1252). The regression is that the subsequent query might receive the cancel signal.
+
+### Added
+ - Add maxResultBuffer property [PR 1657](https://github.com/pgjdbc/pgjdbc/pull/1657)
+ - add caller push of binary data (rebase of #953) [PR 1659](https://github.com/pgjdbc/pgjdbc/pull/1659)
+ 
+### Fixed
+ - Cleanup PGProperty, sort values, and add some missing to docs [PR 1686](https://github.com/pgjdbc/pgjdbc/pull/1686)
+ - Fixing LocalTime rounding (losing precision) [PR 1570](https://github.com/pgjdbc/pgjdbc/pull/1570)
+ - Network Performance of PgDatabaseMetaData.getTypeInfo() method [PR 1668](https://github.com/pgjdbc/pgjdbc/pull/1668)
+ - Issue #1680 updating a boolean field requires special handling to set it to t or f instead of true or false [PR 1682](https://github.com/pgjdbc/pgjdbc/pull/1682)
+ - bug in pgstream for replication [PR 1681](https://github.com/pgjdbc/pgjdbc/pull/1681)
+ - Issue #1677 NumberFormatException when fetching PGInterval with small value [PR 1678](https://github.com/pgjdbc/pgjdbc/pull/1678)
+ - Metadata queries improvements with large schemas. [PR 1673](https://github.com/pgjdbc/pgjdbc/pull/1673)
+ - Utf 8 encoding optimizations [PR 1444](https://github.com/pgjdbc/pgjdbc/pull/1444)
+ - interval overflow [PR 1658](https://github.com/pgjdbc/pgjdbc/pull/1658)
+ - Issue #1482 where the port was being added to the GSSAPI service name [PR 1651](https://github.com/pgjdbc/pgjdbc/pull/1651)
+ - remove receiving EOF from backend after cancel since according to protocol the server closes the connection once cancel is sent (connection reset exception is always thrown) [PR 1641](https://github.com/pgjdbc/pgjdbc/pull/1641)
+ - Unable to register out parameter Issue #1646 [PR 1648](https://github.com/pgjdbc/pgjdbc/pull/1648)
+  
+## [42.2.9] (2019-12-06)
+### Changed
+
+### Added
+ - read only transactions [PR 1252](https://github.com/pgjdbc/pgjdbc/pull/1252)
+ - pkcs12 key functionality [PR 1599](https://github.com/pgjdbc/pgjdbc/pull/1599)
+ - new "escapeSyntaxCallMode" connection property [PR 1560](https://github.com/pgjdbc/pgjdbc/pull/1560)
+ - connection property to limit server error detail in exception exceptions [PR 1579](https://github.com/pgjdbc/pgjdbc/pull/1579)
+ - cancelQuery() to PGConnection public interface [PR 1157](https://github.com/pgjdbc/pgjdbc/pull/1157) 
+ - support for large update counts (JDBC 4.2) [PR 935](https://github.com/pgjdbc/pgjdbc/pull/935)
+ - Add Binary Support for Oid.NUMERIC and Oid.NUMERIC_ARRAY [PR 1636](https://github.com/pgjdbc/pgjdbc/pull/1636) 
+ 
+### Fixed
+ - issue 716 getTypeInfo() may not return data in the order specified in Oracle documentation [PR 1506](https://github.com/pgjdbc/pgjdbc/pull/1506)
+ - PgSQLXML setCharacterStream() results in null value  [PR 1608](https://github.com/pgjdbc/pgjdbc/pull/1608)
+ - get correct column length for simple domains [PR 1605](https://github.com/pgjdbc/pgjdbc/pull/1605)
+ - NPE as a result of calling executeQuery twice on a statement fixes issue [#684](https://github.com/pgjdbc/pgjdbc/issues/684) [PR 1610] (https://github.com/pgjdbc/pgjdbc/pull/1610)
+ - handle numeric domain types [PR 1611](https://github.com/pgjdbc/pgjdbc/pull/1611) 
+ - pginterval to take iso8601 strings [PR 1612](https://github.com/pgjdbc/pgjdbc/pull/1612)
+ - remove currentTimeMillis from code, tests are OK [PR 1617](https://github.com/pgjdbc/pgjdbc/pull/1617) 
+ - NPE when calling setNull on a PreparedStatement with no parameters [PR 1620](https://github.com/pgjdbc/pgjdbc/pull/1620)
+ - allow OUT parameter registration when using CallableStatement native CALL [PR 1561](https://github.com/pgjdbc/pgjdbc/pull/1561)
+ - add release save point into execute with batch [PR 1583](https://github.com/pgjdbc/pgjdbc/pull/1583) 
+ - Prevent use of extended query protocol for BEGIN before COPY [PR 1639](https://github.com/pgjdbc/pgjdbc/pull/1639)
+
+## [42.2.8] (2019-09-13)
+### Changed
+
+### Added
+
+### Fixed
+
+* fix: Revert inet default Java type to PGObject and handle values with net masks [PR 1568](https://github.com/pgjdbc/pgjdbc/pull/1568) 
+
+## [42.2.7] (2019-09-03)
+### Changed
+
+
+### Added
+- Expose parameter status messages (GUC_REPORT) to the user [PR 1435](https://github.com/pgjdbc/pgjdbc/pull/1435)
+- Add automatic module name to manifest for jdk9+ [PR 1538](https://github.com/pgjdbc/pgjdbc/pull/1538)
+- Log ignoring rollback when no transaction in progress [PR 1549](https://github.com/pgjdbc/pgjdbc/pull/1549)
+- Map inet type to InetAddress [PR 1527](https://github.com/pgjdbc/pgjdbc/pull/1527) [issue 1134](https://github.com/pgjdbc/pgjdbc/issues/1134)
+
+### Fixed
+- fix [issue 1547](https://github.com/pgjdbc/pgjdbc/issues/1547) As long as peek returns some bytes do not reset the timeout, this allows us to continue checking until any async notifies are consumed [PR 1548](https://github.com/pgjdbc/pgjdbc/pull/1548)
+- fix: [issue 1466](https://github.com/pgjdbc/pgjdbc/issues/1466) In logical decoding the if the backend was requesting a reply we… [PR 1467](https://github.com/pgjdbc/pgjdbc/pull/1467) 
+- fix: [issue 1534](https://github.com/pgjdbc/pgjdbc/issues/1534) Proleptic java.time support [PR 1539](https://github.com/pgjdbc/pgjdbc/pull/1539)
+- fix Ensure isValid() will not last more than timeout seconds [PR 1557](https://github.com/pgjdbc/pgjdbc/pull/1557)
+## [42.2.6] (2019-06-19)
+### Known issues
+- Waffle has [dropped support](https://github.com/Waffle/waffle/releases/tag/waffle-1.9.0) for 1.6, 1.7 as such the new waffle 1.9.x is only available in jre8
+- Microseconds in timestamps might be truncated when transferred in binary mode
+- 24:00 time handling is not consistent [issue 1385](https://github.com/pgjdbc/pgjdbc/issues/1385)
+- Unexpected packet type during stream replication [issue 1466](https://github.com/pgjdbc/pgjdbc/issues/1466)
+- Driver goes missing after OSGi bundle restart [issue 1476](https://github.com/pgjdbc/pgjdbc/issues/1476)
+### Changed
+- Change IS_GENERATED to IS_GENERATEDCOLUMN as per spec [PR 1485](https://github.com/pgjdbc/pgjdbc/pull/1485)
+- Fix missing metadata columns, and misspelled columns in PgDatabaseMetaData#getTables [PR 1323](https://github.com/pgjdbc/pgjdbc/pull/1323)
+
+### Added
+- CI tests with Java 11, and Java EA
+- Support temporary replication slots in ReplicationCreateSlotBuilder [PR 1306](https://github.com/pgjdbc/pgjdbc/pull/1306)
+- Support PostgreSQL 11, 12
+- Return function (PostgreSQL 11) columns in PgDatabaseMetaData#getFunctionColumns
+- Return information on create replication slot, now the snapshot_name is exported
+  to allow a consistent snapshot in some uses cases. [PR 1335](https://github.com/pgjdbc/pgjdbc/pull/1335)
+
+### Fixed
+- Fixed async copy performance (1ms per op) in SSL mode [PR 1314](https://github.com/pgjdbc/pgjdbc/pull/1314)
+- Return Double.NaN for 'NaN'::numeric [PR 1304](https://github.com/pgjdbc/pgjdbc/pull/1304)
+- Performance issue in PgDatabaseMetaData#getTypeInfo with lots of types in DB [PR 1302](https://github.com/pgjdbc/pgjdbc/pull/1302)
+- PGCopyInputStream#read should cap values to [0, 255], -1 [PR 1349](https://github.com/pgjdbc/pgjdbc/pull/1349)
+- Fixes LocalDateTime handling of BC dates [PR 1388](https://github.com/pgjdbc/pgjdbc/pull/1388)
+- Release savepoints in autosave mode to prevent out of shared memory errors at the server side [PR 1409](https://github.com/pgjdbc/pgjdbc/pull/1409)
+- Fix execution with big decimal in simple query mode. [PR 1463](https://github.com/pgjdbc/pgjdbc/pull/1463)
+- Fix rounding for timestamps truncated to dates before 1970 [PR 1502](https://github.com/pgjdbc/pgjdbc/pull/1502)
+
+
+## [42.2.5] (2018-08-27)
+### Known issues
+- 1ms per async copy call [issue 1312](https://github.com/pgjdbc/pgjdbc/issues/1312)
+
+### Changed
+- `ssl=true` implies `sslmode=verify-full`, that is it requires valid server certificate [cdeeaca4](https://github.com/pgjdbc/pgjdbc/commit/cdeeaca47dc3bc6f727c79a582c9e4123099526e)
+
+targetServerType=master has been deprecated in favour of targetServerType=primary. master
+will still be accepted but not documented.
+### Added
+- Support for `sslmode=allow/prefer/require` [cdeeaca4](https://github.com/pgjdbc/pgjdbc/commit/cdeeaca47dc3bc6f727c79a582c9e4123099526e)
+
+### Fixed
+- Security: added server hostname verification for non-default SSL factories in `sslmode=verify-full` (CVE-2018-10936) [cdeeaca4](https://github.com/pgjdbc/pgjdbc/commit/cdeeaca47dc3bc6f727c79a582c9e4123099526e)
+- Updated documentation on SSL configuration [fa032732](https://github.com/pgjdbc/pgjdbc/commit/fa032732acfe51c6e663ee646dd5c1beaa1af857)
+- Updated Japanese translations [PR 1275](https://github.com/pgjdbc/pgjdbc/pull/1275)
+- IndexOutOfBounds on prepared multistatement with insert values [c2885dd0](https://github.com/pgjdbc/pgjdbc/commit/c2885dd0cfc793f81e5dd3ed2300bb32476eb14a)
+
+## [42.2.4] (2018-07-14)
+### Changed
+- PreparedStatement.setNull(int parameterIndex, int t, String typeName) no longer ignores the typeName
+argument if it is not null [PR 1160](https://github.com/pgjdbc/pgjdbc/pull/1160)
+
+### Fixed
+- Fix treatment of SQL_TSI_YEAR, SQL_TSI_WEEK, SQL_TSI_MINUTE [PR 1250](https://github.com/pgjdbc/pgjdbc/pull/1250)
+- Map integrity constraint violation to XA_RBINTEGRITY instead of XAER_RMFAIL [PR 1175](https://github.com/pgjdbc/pgjdbc/pull/1175) [f2d1352c](https://github.com/pgjdbc/pgjdbc/commit/f2d1352c2b3ea98492beb6127cd6d95039a0b92f)
+
+## [42.2.3] (2018-07-12)
+### Known issues
+- SQL_TSI_YEAR is treated as hour, SQL_TSI_WEEK is treated as hour, SQL_TSI_MINUTE is treated as second
+
+### Changed
+- Reduce the severity of the error log messages when an exception is re-thrown. The error will be 
+thrown to caller to be dealt with so no need to log at this verbosity by pgjdbc  [PR 1187](https://github.com/pgjdbc/pgjdbc/pull/1187)
+- Deprecate Fastpath API [PR 903](https://github.com/pgjdbc/pgjdbc/pull/903)
+- Support parenthesis in {oj ...} JDBC escape syntax [PR 1204](https://github.com/pgjdbc/pgjdbc/pull/1204)
+- ubenchmark module moved pgjdbc/benchmarks repository due to licensing issues [PR 1215](https://github.com/pgjdbc/pgjdbc/pull/1215)
+- Include section on how to submit a bug report in CONTRIBUTING.md [PR 951](https://github.com/pgjdbc/pgjdbc/pull/951)
+
+### Fixed
+- getString for PGObject-based types returned "null" string instead of null [PR 1154](https://github.com/pgjdbc/pgjdbc/pull/1154)
+- Field metadata cache can be disabled via databaseMetadataCacheFields=0 [PR 1052](https://github.com/pgjdbc/pgjdbc/pull/1052)
+- Properly encode special symbols in passwords in BaseDataSource [PR 1201](https://github.com/pgjdbc/pgjdbc/pull/1201)
+- Adjust date, hour, minute, second when rounding nanosecond part of a timestamp [PR 1212](https://github.com/pgjdbc/pgjdbc/pull/1212)
+- perf: reduce memory allocations in query cache [PR 1227](https://github.com/pgjdbc/pgjdbc/pull/1227)
+- perf: reduce memory allocations in SQL parser [PR 1230](https://github.com/pgjdbc/pgjdbc/pull/1230), [PR 1233](https://github.com/pgjdbc/pgjdbc/pull/1233)
+- Encode URL parameters in BaseDataSource [PR 1201](https://github.com/pgjdbc/pgjdbc/pull/1201)
+- Improve JavaDoc formatting [PR 1236](https://github.com/pgjdbc/pgjdbc/pull/1236)
+
+## [42.2.2] (2018-03-15)
+### Added
+- Documentation on server-side prepared statements [PR 1135](https://github.com/pgjdbc/pgjdbc/pull/1135)
+
+### Fixed
+- Avoid failure for `insert ... on conflict...update` for `reWriteBatchedInserts=true` case [PR 1130](https://github.com/pgjdbc/pgjdbc/pull/1130)
+- fix: allowEncodingChanges should allow set client_encoding=... [PR 1125](https://github.com/pgjdbc/pgjdbc/pull/1125)
+- Wrong data from Blob/Clob when mark/reset is used [PR 971](https://github.com/pgjdbc/pgjdbc/pull/971)
+- Adjust XAException return codes for better compatibility with XA specification [PR 782](https://github.com/pgjdbc/pgjdbc/pull/782)
+- Wrong results when single statement is used with different bind types[PR 1137](https://github.com/pgjdbc/pgjdbc/pull/1137)
+- Support generated keys for WITH queries that miss RETURNING [PR 1138](https://github.com/pgjdbc/pgjdbc/pull/1138)
+- Support generated keys when INSERT/UPDATE/DELETE keyword is followed by a comment [PR 1138](https://github.com/pgjdbc/pgjdbc/pull/1138)
+
+## [42.2.1] (2018-01-25)
+### Known issues
+- client_encoding has to be UTF8 even with allowEncodingChanges=true
+
+### Changed
+- socksProxyHost is ignored in case it contains empty string [PR 1079](https://github.com/pgjdbc/pgjdbc/pull/1079)
+
+### Fixed
+- Avoid connection failure when `DateStyle` is set to `ISO` (~PgBouncer) [Issue 1080](https://github.com/pgjdbc/pgjdbc/issues/1080)
+- Package scram:client classes, so SCRAM works when using a shaded jar [PR 1091](https://github.com/pgjdbc/pgjdbc/pull/1091) [1a89290e](https://github.com/pgjdbc/pgjdbc/commit/1a89290e110d5863b35e0a2ccf79e4292c1056f8)
+- reWriteBatchedInserts=true causes syntax error with ON CONFLICT [Issue 1045](https://github.com/pgjdbc/pgjdbc/issues/1045) [PR 1082](https://github.com/pgjdbc/pgjdbc/pull/1082)
+- Avoid failure in getPGArrayType when stringType=unspecified [PR 1036](https://github.com/pgjdbc/pgjdbc/pull/1036)
+- For PostgreSQL 9.0+ return a complete list of keywords in DatabaseMetadata.getSQLKeywords() from pg_catalog.pg_get_keywords(). [PR 940](https://github.com/pgjdbc/pgjdbc/pull/940)
+
+## [42.2.0] (2018-01-17)
+### Known issues
+- SCRAM does not work as scram:client library is not packaged
+- client_encoding has to be UTF8 even with allowEncodingChanges=true
+
+### Added
+- Support SCRAM-SHA-256 for PostgreSQL 10 in the JDBC 4.2 version (Java 8+) using the Ongres SCRAM library. [PR 842](https://github.com/pgjdbc/pgjdbc/pull/842)
+- Make SELECT INTO and CREATE TABLE AS return row counts to the client in their command tags. [Issue 958](https://github.com/pgjdbc/pgjdbc/issues/958) [PR 962](https://github.com/pgjdbc/pgjdbc/pull/962)
+- Support Subject Alternative Names for SSL connections. [PR 952](https://github.com/pgjdbc/pgjdbc/pull/952)
+- Support isAutoIncrement metadata for PostgreSQL 10 IDENTITY column. [PR 1004](https://github.com/pgjdbc/pgjdbc/pull/1004)
+- Support for primitive arrays [PR#887](https://github.com/pgjdbc/pgjdbc/pull/887) [3e0491a](https://github.com/pgjdbc/pgjdbc/commit/3e0491ac3833800721b98e7437635cf6ab338162)
+- Implement support for get/setNetworkTimeout() in connections. [PR 849](https://github.com/pgjdbc/pgjdbc/pull/849)
+- Make GSS JAAS login optional, add an option "jaasLogin" [PR 922](https://github.com/pgjdbc/pgjdbc/pull/922) see [Connecting to the Database](https://jdbc.postgresql.org/documentation/head/connect.html)
+
+### Changed
+- Improve behaviour of ResultSet.getObject(int, Class). [PR 932](https://github.com/pgjdbc/pgjdbc/pull/932)
+- Parse CommandComplete message using a regular expression, allows complete catch of server returned commands for INSERT, UPDATE, DELETE, SELECT, FETCH, MOVE, COPY and future commands. [PR 962](https://github.com/pgjdbc/pgjdbc/pull/962)
+- Use 'time with timezone' and 'timestamp with timezone' as is and ignore the user provided Calendars, 'time' and 'timestamp' work as earlier except "00:00:00" now maps to 1970-01-01 and "24:00:00" uses the system provided Calendar ignoring the user-provided one [PR 1053](https://github.com/pgjdbc/pgjdbc/pull/1053)
+- Change behaviour of multihost connection. The new behaviour is to try all secondaries first before trying the master [PR 844](https://github.com/pgjdbc/pgjdbc/pull/844).
+- Avoid reflective access to TimeZone.defaultTimeZone in Java 9+ [PR 1002](https://github.com/pgjdbc/pgjdbc/pull/1002) fixes [Issue 986](https://github.com/pgjdbc/pgjdbc/issues/986)
+
+### Fixed
+- Make warnings available as soon as they are received from the server. This is useful for long running queries, where it can be beneficial to know about a warning before the query completes. [PR 857](https://github.com/pgjdbc/pgjdbc/pull/857)
+- Use 00:00:00 and 24:00:00 for LocalTime.MIN/MAX. [PR 992](https://github.com/pgjdbc/pgjdbc/pull/992)
+- Now the DatabaseMetaData.getFunctions() implementation complies with the JDBC docs. [PR 918](https://github.com/pgjdbc/pgjdbc/pull/918)
+- Execute autosave/rollback savepoint via simple queries always to prevent "statement S_xx not exists" when autosaving fixes [Issue #955](https://github.com/pgjdbc/pgjdbc/issues/955)
+- Received resultset tuples, but no field structure for them" when bind failure happens on 5th execution of a statement [Issue 811](https://github.com/pgjdbc/pgjdbc/issues/811)
+
+### Removed
+- Drop support for the (insecure) crypt authentication method. [PR 1026](https://github.com/pgjdbc/pgjdbc/pull/1026)
+
+### Deprecated
+- Reintroduce Driver.getVersion for backward compatibility reasons, mark it as deprecated as application should not rely on it (regression since 42.0.0) [50d5dd3e](https://github.com/pgjdbc/pgjdbc/commit/50d5dd3e708a92602e04d6b4aa0822ad3f110a78)
+
+## [42.1.4] (2017-08-01)
+### Changed
+- Statements with non-zero fetchSize no longer require server-side named handle. This might cause issues when using old PostgreSQL versions (pre-8.4)+fetchSize+interleaved ResultSet processing combo. [Issue 869](https://github.com/pgjdbc/pgjdbc/issues/869)
+
+## [42.1.3] (2017-07-14)
+### Fixed
+- Fix NPE in PreparedStatement.executeBatch in case of empty batch (regression since 42.1.2). [PR 867](https://github.com/pgjdbc/pgjdbc/pull/867)
+
+## [42.1.2] (2017-07-12)
+### Changed
+- Better logic for *returning* keyword detection. Previously, pgjdbc could be defeated by column names that contain *returning*, so pgjdbc failed to "return generated keys" as it considered statement as already having *returning* keyword [PR 824](https://github.com/pgjdbc/pgjdbc/pull/824) [201daf1d](https://github.com/pgjdbc/pgjdbc/commit/201daf1dc916bbc35e2bbec961aebfd1b1e30bfc) 
+- Use server-prepared statements for batch inserts when prepareThreshold>0. Note: this enables batch to use server-prepared from the first *executeBatch()* execution (previously it waited for *prepareThreshold* *executeBatch()* calls) [abc3d9d7](https://github.com/pgjdbc/pgjdbc/commit/abc3d9d7f34a001322fbbe53f25d5e77a33a667f)
+
+### Fixed
+- Replication API: fix issue in #834 setting statusIntervalUpdate causes high CPU load. [PR 835](https://github.com/pgjdbc/pgjdbc/pull/835) [59236b74](https://github.com/pgjdbc/pgjdbc/commit/59236b74acdd400d9d91d3eb2bb07d70b15392e5)
+
+### Regressions
+- NPE in PreparedStatement.executeBatch in case of empty batch. Fixed in 42.1.3
+
+## [42.1.1] (2017-05-05)
+### Fixed
+- Fix infinite dates that might be corrupted when transferred in binary for certain JREs. For instance, 5881610-07-11 instead of infinity. [1e5bf563](https://github.com/pgjdbc/pgjdbc/commit/1e5bf563f41203417281117ed20b183cd295b4e0)
+
+## [42.1.0] (2017-05-04)
+### Added
+- Support fetching a REF_CURSOR using getObject [PR 809](https://github.com/pgjdbc/pgjdbc/pull/809)
+
+### Fixed
+- Fix data being truncated in setCharacterStream (bug introduced in 42.0.0) [PR 802](https://github.com/pgjdbc/pgjdbc/pull/802)
+- Fix calculation of lastReceiveLSN for logical replication [PR 801](https://github.com/pgjdbc/pgjdbc/pull/801)
+- Make sure org.postgresql.Driver is loaded when accessing though DataSource interface [Issue 768](https://github.com/pgjdbc/pgjdbc/issues/768)
+
+### Regressions
+- There's no 42.1.0.jre6 version due to infinity handling bug. Fixed in 42.1.1.jre6
+
+## [42.0.0] (2017-02-20)
+### Added
+- Replication protocol API was added: [replication API documentation](https://jdbc.postgresql.org//documentation/head/replication.html). [PR 550](https://github.com/pgjdbc/pgjdbc/pull/550)
+- java.util.logging is now used for logging: [logging documentation](https://jdbc.postgresql.org//documentation/head/logging.html). [PR 722](https://github.com/pgjdbc/pgjdbc/pull/722)
+- Add support for PreparedStatement.setCharacterStream(int, Reader). [ee4c4265](https://github.com/pgjdbc/pgjdbc/commit/ee4c4265aebc1c73a1d1fabac5ba259d1fbfd1e4)
+
+### Changed
+- Version bumped to 42.0.0 to avoid version clash with PostgreSQL version and follow a better semantic versioning. [46634923](https://github.com/pgjdbc/pgjdbc/commit/466349236622c6b03bb9cd8d7f517c3ce0586751)
+- Ensure executeBatch() can be used with pgbouncer. Previously pgjdbc could use server-prepared statements for batch execution even with prepareThreshold=0. [Issue 742](https://github.com/pgjdbc/pgjdbc/issues/742)
+- Error position is displayed when SQL has unterminated literals, comments, etc. [Issue 688](https://github.com/pgjdbc/pgjdbc/issues/688)
+- Strict handling of accepted values in getBoolean and setObject(BOOLEAN), now it follows PostgreSQL accepted values, only 1 and 0 for numeric types are accepted (previously !=0 was true). [PR 732](https://github.com/pgjdbc/pgjdbc/pull/732)
+- Return correct versions and name of the driver. [PR 668](https://github.com/pgjdbc/pgjdbc/pull/668)
+
+### Removed
+- Support for PostgreSQL versions below 8.2 was dropped. [PR 661](https://github.com/pgjdbc/pgjdbc/pull/661)
+
+### Deprecated
+- Deprecated PGPoolingDataSource, instead of this class you should use a fully featured connection pool like HikariCP, vibur-dbcp, commons-dbcp, c3p0, etc. [PR 739](https://github.com/pgjdbc/pgjdbc/pull/739)
+
+### Regressions
+- Data truncated in setCharacterStream. Fixed in 42.1.0
+- No suitable driver found for jdbc:postgresql when using a DataSource implementation. Fixed in 42.1.0
+
+
+[42.0.0]: https://github.com/pgjdbc/pgjdbc/compare/REL9.4.1212...REL42.0.0
+[42.1.0]: https://github.com/pgjdbc/pgjdbc/compare/REL42.0.0...REL42.1.0
+[42.1.1]: https://github.com/pgjdbc/pgjdbc/compare/REL42.1.0...REL42.1.1
+[42.1.2]: https://github.com/pgjdbc/pgjdbc/compare/REL42.1.1...REL42.1.2
+[42.1.3]: https://github.com/pgjdbc/pgjdbc/compare/REL42.1.2...REL42.1.3
+[42.1.4]: https://github.com/pgjdbc/pgjdbc/compare/REL42.1.3...REL42.1.4
+[42.2.0]: https://github.com/pgjdbc/pgjdbc/compare/REL42.1.4...REL42.2.0
+[42.2.1]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.0...REL42.2.1
+[42.2.2]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.1...REL42.2.2
+[42.2.3]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.2...REL42.2.3
+[42.2.4]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.3...REL42.2.4
+[42.2.5]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.4...REL42.2.5
+[42.2.6]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.5...REL42.2.6
+[42.2.7]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.6...REL42.2.7
+[42.2.8]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.7...REL42.2.8
+[42.2.9]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.8...REL42.2.9
+[42.2.10]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.9...REL42.2.10
+[42.2.11]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.10...REL42.2.11
+[42.2.12]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.11...REL42.2.12
+[42.2.13]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.12...REL42.2.13
+[42.2.14]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.13...REL42.2.14
+[42.2.15]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.14...REL42.2.15
+[42.2.16]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.15...REL42.2.16
+[42.2.17]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.16...REL42.2.17
+[42.2.18]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.17...REL42.2.18
+[42.2.19]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.18...REL42.2.19
+[42.2.20]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.19...REL42.2.20
+[42.2.21]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.20...REL42.2.21
+[42.2.22]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.21...REL42.2.22
+[42.2.23]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.22...REL42.2.23
+[42.2.24]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.23...REL42.2.24
+[42.2.25]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.24...REL42.2.25
+[42.3.0]: https://github.com/pgjdbc/pgjdbc/compare/REL42.2.24...REL42.3.0
+[42.3.1]: https://github.com/pgjdbc/pgjdbc/compare/REL42.3.0...REL42.3.1
+[42.3.2]: https://github.com/pgjdbc/pgjdbc/compare/REL42.3.1...REL42.3.2
+[42.3.3]: https://github.com/pgjdbc/pgjdbc/compare/REL42.3.2...REL42.3.3
+[42.3.4]: https://github.com/pgjdbc/pgjdbc/compare/REL42.3.3...REL42.3.4
+[42.3.5]: https://github.com/pgjdbc/pgjdbc/compare/REL42.3.4...REL42.3.5
+[42.3.6]: https://github.com/pgjdbc/pgjdbc/compare/REL42.3.5...REL42.3.6
+[42.4.0]: https://github.com/pgjdbc/pgjdbc/compare/REL42.3.6...REL42.4.0
+[42.4.1]: https://github.com/pgjdbc/pgjdbc/compare/REL42.4.0...REL42.4.1
+[42.4.2]: https://github.com/pgjdbc/pgjdbc/compare/REL42.4.1...REL42.4.2
+[42.5.0]: https://github.com/pgjdbc/pgjdbc/compare/REL42.4.2...REL42.5.0
+[42.5.0]: https://github.com/pgjdbc/pgjdbc/compare/REL42.5.0...REL42.5.1
+[Unreleased]: https://github.com/pgjdbc/pgjdbc/compare/REL42.5.1...HEAD

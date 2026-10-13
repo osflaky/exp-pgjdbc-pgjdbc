@@ -1,0 +1,619 @@
+/*
+ * Copyright (c) 2010, PostgreSQL Global Development Group
+ * See the LICENSE file in the project root for more information.
+ */
+
+package org.postgresql.test.jdbc4.jdbc41;
+
+import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.core.IsEqual.equalTo;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+
+import org.postgresql.PGConnection;
+import org.postgresql.PGProperty;
+import org.postgresql.core.ServerVersion;
+import org.postgresql.jdbc.AutoSave;
+import org.postgresql.jdbc.PreferQueryMode;
+import org.postgresql.test.TestUtil;
+import org.postgresql.util.PSQLException;
+import org.postgresql.util.PSQLState;
+
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.sql.Types;
+import java.util.Properties;
+
+class SchemaTest {
+  private Connection conn;
+  private static boolean dropUserSchema;
+
+  @BeforeAll
+  static void createTables() throws Exception {
+    try (Connection conn = TestUtil.openDB()) {
+      Statement stmt = conn.createStatement();
+      try {
+        stmt.execute("CREATE SCHEMA " + TestUtil.getUser());
+        dropUserSchema = true;
+      } catch (SQLException e) {
+        /* assume schema existed */
+      }
+      stmt.execute("CREATE SCHEMA schema1");
+      stmt.execute("CREATE SCHEMA schema2");
+      stmt.execute("CREATE SCHEMA \"schema 3\"");
+      stmt.execute("CREATE SCHEMA \"schema \"\"4\"");
+      stmt.execute("CREATE SCHEMA \"schema '5\"");
+      stmt.execute("CREATE SCHEMA \"schema ,6\"");
+      stmt.execute("CREATE SCHEMA \"UpperCase\"");
+      TestUtil.createTable(conn, "schema1.table1", "id integer");
+      TestUtil.createTable(conn, "schema2.table2", "id integer");
+      TestUtil.createTable(conn, "\"UpperCase\".table3", "id integer");
+      TestUtil.createTable(conn, "schema1.sptest", "id integer");
+      TestUtil.createTable(conn, "schema2.sptest", "id varchar");
+      // The user schema is first in the default search_path ("$user", public), so a RESET that
+      // restores the default resolves the unqualified sptest to this BIGINT table.
+      TestUtil.createTable(conn, TestUtil.getUser() + ".sptest", "id bigint");
+      stmt.close();
+    }
+  }
+
+  @AfterAll
+  static void dropTables() throws Exception {
+    try (Connection conn = TestUtil.openDB()) {
+      Statement stmt = conn.createStatement();
+      if (dropUserSchema) {
+        stmt.execute("DROP SCHEMA " + TestUtil.getUser() + " CASCADE");
+      }
+      stmt.execute("DROP SCHEMA schema1 CASCADE");
+      stmt.execute("DROP SCHEMA schema2 CASCADE");
+      stmt.execute("DROP SCHEMA \"schema 3\" CASCADE");
+      stmt.execute("DROP SCHEMA \"schema \"\"4\" CASCADE");
+      stmt.execute("DROP SCHEMA \"schema '5\" CASCADE");
+      stmt.execute("DROP SCHEMA \"schema ,6\"");
+      stmt.execute("DROP SCHEMA \"UpperCase\" CASCADE");
+      stmt.close();
+    }
+  }
+
+  @BeforeEach
+  void setUp() throws Exception {
+    conn = TestUtil.openDB();
+  }
+
+  @AfterEach
+  void tearDown() throws SQLException {
+    conn.setAutoCommit(true);
+    conn.setSchema(null);
+    // Clean up objects created by individual test methods
+    TestUtil.execute(conn, "DROP FUNCTION IF EXISTS schema2.check_fun()");
+    TestUtil.execute(conn, "DROP FUNCTION IF EXISTS schema2.check_fun(text)");
+    TestUtil.execute(conn, "DROP TABLE IF EXISTS schema1.check_table");
+    TestUtil.closeDB(conn);
+  }
+
+  /**
+   * Test that what you set is what you get.
+   */
+  @Test
+  void getSetSchema() throws SQLException {
+    conn.setSchema("schema1");
+    assertEquals("schema1", conn.getSchema());
+    conn.setSchema("schema2");
+    assertEquals("schema2", conn.getSchema());
+    conn.setSchema("schema 3");
+    assertEquals("schema 3", conn.getSchema());
+    conn.setSchema("schema \"4");
+    assertEquals("schema \"4", conn.getSchema());
+    conn.setSchema("schema '5");
+    assertEquals("schema '5", conn.getSchema());
+    conn.setSchema("UpperCase");
+    assertEquals("UpperCase", conn.getSchema());
+  }
+
+  /**
+   * Test that setting the schema allows to access objects of this schema without prefix, hide
+   * objects from other schemas but doesn't prevent to prefix-access to them.
+   */
+  @Test
+  void usingSchema() throws SQLException {
+    Statement stmt = conn.createStatement();
+    try {
+      assertDoesNotThrow(() -> {
+        conn.setSchema("schema1");
+        stmt.executeQuery(TestUtil.selectSQL("table1", "*"));
+        stmt.executeQuery(TestUtil.selectSQL("schema2.table2", "*"));
+        try {
+          stmt.executeQuery(TestUtil.selectSQL("table2", "*"));
+          fail("Objects of schema2 should not be visible without prefix");
+        } catch (SQLException e) {
+          // expected
+        }
+
+        conn.setSchema("schema2");
+        stmt.executeQuery(TestUtil.selectSQL("table2", "*"));
+        stmt.executeQuery(TestUtil.selectSQL("schema1.table1", "*"));
+        try {
+          stmt.executeQuery(TestUtil.selectSQL("table1", "*"));
+          fail("Objects of schema1 should not be visible without prefix");
+        } catch (SQLException e) {
+          // expected
+        }
+
+        conn.setSchema("UpperCase");
+        stmt.executeQuery(TestUtil.selectSQL("table3", "*"));
+        stmt.executeQuery(TestUtil.selectSQL("schema1.table1", "*"));
+        try {
+          stmt.executeQuery(TestUtil.selectSQL("table1", "*"));
+          fail("Objects of schema1 should not be visible without prefix");
+        } catch (SQLException e) {
+          // expected
+        }
+      }, "Could not find expected schema elements: ");
+    } finally {
+      try {
+        stmt.close();
+      } catch (SQLException e) {
+      }
+    }
+  }
+
+  /**
+   * Test that get schema returns the schema with the highest priority in the search path.
+   */
+  @Test
+  void multipleSearchPath() throws SQLException {
+    execute("SET search_path TO schema1,schema2");
+    assertEquals("schema1", conn.getSchema());
+
+    execute("SET search_path TO \"schema ,6\",schema2");
+    assertEquals("schema ,6", conn.getSchema());
+  }
+
+  @Test
+  void schemaInProperties() throws Exception {
+    Properties properties = new Properties();
+    properties.setProperty("currentSchema", "schema1");
+    try (Connection conn = TestUtil.openDB(properties)) {
+      assertEquals("schema1", conn.getSchema());
+
+      Statement stmt = conn.createStatement();
+      stmt.executeQuery(TestUtil.selectSQL("table1", "*"));
+      stmt.executeQuery(TestUtil.selectSQL("schema2.table2", "*"));
+      try {
+        stmt.executeQuery(TestUtil.selectSQL("table2", "*"));
+        fail("Objects of schema2 should not be visible without prefix");
+      } catch (SQLException e) {
+        // expected
+      }
+    }
+  }
+
+  @Test
+  public void schemaPath$User() throws Exception {
+    execute("SET search_path TO \"$user\",public,schema2");
+    assertEquals(TestUtil.getUser(), conn.getSchema());
+  }
+
+  private void execute(String sql) throws SQLException {
+    Statement stmt = conn.createStatement();
+    try {
+      stmt.execute(sql);
+    } finally {
+      try {
+        stmt.close();
+      } catch (SQLException e) {
+      }
+    }
+  }
+
+  @Test
+  void searchPathPreparedStatementAutoCommitFalse() throws SQLException {
+    conn.setAutoCommit(false);
+    searchPathPreparedStatementAutoCommitTrue();
+  }
+
+  @Test
+  void searchPathPreparedStatementAutoCommitTrue() throws SQLException {
+    searchPathPreparedStatement();
+  }
+
+  @Test
+  void searchPathPreparedStatement() throws SQLException {
+    execute("set search_path to schema1,public");
+    PreparedStatement ps = conn.prepareStatement("select * from sptest");
+    for (int i = 0; i < 10; i++) {
+      ps.execute();
+    }
+    assertColType(ps, "sptest should point to schema1.sptest, thus column type should be INT",
+        Types.INTEGER);
+    ps.close();
+    execute("set search_path to schema2,public");
+    ps = conn.prepareStatement("select * from sptest");
+    assertColType(ps, "sptest should point to schema2.sptest, thus column type should be VARCHAR",
+        Types.VARCHAR);
+    ps.close();
+  }
+
+  /**
+   * The command tag is always upper-case, but the user-supplied SQL may use any case, so an
+   * upper-case {@code SET SEARCH_PATH} must invalidate the prepared statement cache just like the
+   * lower-case form does. With autoCommit=false a missed invalidation surfaces as a
+   * "cached plan must not change result type" error that aborts the transaction, which the
+   * reparse-on-error fallback can no longer heal, so this variant guards the regression.
+   */
+  @Test
+  void searchPathPreparedStatementUpperCaseAutoCommitFalse() throws SQLException {
+    conn.setAutoCommit(false);
+    searchPathPreparedStatementUpperCase();
+  }
+
+  @Test
+  void searchPathPreparedStatementUpperCaseAutoCommitTrue() throws SQLException {
+    searchPathPreparedStatementUpperCase();
+  }
+
+  private void searchPathPreparedStatementUpperCase() throws SQLException {
+    execute("SET SEARCH_PATH TO schema1,public");
+    try (PreparedStatement ps = conn.prepareStatement("select * from sptest")) {
+      for (int i = 0; i < 10; i++) {
+        ps.execute();
+      }
+      assertColType(ps, "sptest should point to schema1.sptest, thus column type should be INT",
+          Types.INTEGER);
+    }
+    execute("SET SEARCH_PATH TO schema2,public");
+    try (PreparedStatement ps = conn.prepareStatement("select * from sptest")) {
+      assertColType(ps, "sptest should point to schema2.sptest, thus column type should be VARCHAR",
+          Types.VARCHAR);
+    }
+  }
+
+  /**
+   * {@code RESET search_path} restores the default search_path, so it must invalidate the prepared
+   * statement cache just like {@code SET search_path} does. As with {@code SET}, the
+   * autoCommit=false variant is the real guard: under autoCommit=true the reparse-on-error
+   * fallback hides a missed invalidation.
+   */
+  @Test
+  void searchPathPreparedStatementResetAutoCommitFalse() throws SQLException {
+    conn.setAutoCommit(false);
+    searchPathPreparedStatementReset("RESET search_path");
+  }
+
+  @Test
+  void searchPathPreparedStatementResetAutoCommitTrue() throws SQLException {
+    searchPathPreparedStatementReset("RESET search_path");
+  }
+
+  /**
+   * {@code RESET ALL} reverts every session parameter, search_path included, so it must invalidate
+   * the prepared statement cache too.
+   */
+  @Test
+  void searchPathPreparedStatementResetAllAutoCommitFalse() throws SQLException {
+    conn.setAutoCommit(false);
+    searchPathPreparedStatementReset("RESET ALL");
+  }
+
+  @Test
+  void searchPathPreparedStatementResetAllAutoCommitTrue() throws SQLException {
+    searchPathPreparedStatementReset("RESET ALL");
+  }
+
+  private void searchPathPreparedStatementReset(String resetSql) throws SQLException {
+    execute("SET search_path TO schema1,public");
+    try (PreparedStatement ps = conn.prepareStatement("select * from sptest")) {
+      for (int i = 0; i < 10; i++) {
+        ps.execute();
+      }
+      assertColType(ps, "sptest should point to schema1.sptest, thus column type should be INT",
+          Types.INTEGER);
+    }
+    execute(resetSql);
+    try (PreparedStatement ps = conn.prepareStatement("select * from sptest")) {
+      assertColType(ps, resetSql + " should restore the default search_path, where sptest is the "
+          + "BIGINT table in the user schema", Types.BIGINT);
+    }
+  }
+
+  /**
+   * A {@code RESET} of an unrelated parameter leaves search_path untouched, so the prepared
+   * statement keeps resolving to the same table. This also covers the "RESET, but neither
+   * search_path nor ALL" path, where the cache must not be invalidated.
+   */
+  @Test
+  void resetUnrelatedParameterKeepsSearchPath() throws SQLException {
+    execute("SET search_path TO schema1,public");
+    try (PreparedStatement ps = conn.prepareStatement("select * from sptest")) {
+      for (int i = 0; i < 10; i++) {
+        ps.execute();
+      }
+      assertColType(ps, "sptest should point to schema1.sptest, thus column type should be INT",
+          Types.INTEGER);
+      execute("RESET statement_timeout");
+      assertColType(ps, "RESET statement_timeout must not change search_path, so sptest still "
+          + "points to schema1.sptest", Types.INTEGER);
+    }
+  }
+
+  /**
+   * A search_path change wrapped in {@code set_config()} reports a SELECT command tag, so the driver
+   * does not detect it from the command tag, yet a reused server-side prepared statement still
+   * returns rows from the table the current search_path selects. On PostgreSQL 17 and older the
+   * backend re-plans the reused cached statement (since 9.3; 9.1 keeps the old plan); on 18+ the
+   * driver also invalidates its cache from the GUC_REPORT and re-prepares. Either way the rows are
+   * correct.
+   *
+   * @see <a href="https://github.com/pgjdbc/pgjdbc/issues/3399">issue 3399</a>
+   */
+  @Test
+  void searchPathPreparedStatementUndetectedChangeStaysCorrect() throws SQLException {
+    assumeTrue(TestUtil.haveMinimumServerVersion(conn, ServerVersion.v9_3));
+    // Two schemas hold a table of the same shape but different rows.
+    TestUtil.createSchema(conn, "sphidden1");
+    TestUtil.createSchema(conn, "sphidden2");
+    try {
+      TestUtil.createTable(conn, "sphidden1.hidden_tbl", "val text");
+      TestUtil.createTable(conn, "sphidden2.hidden_tbl", "val text");
+      TestUtil.execute(conn, "INSERT INTO sphidden1.hidden_tbl VALUES ('from_1')");
+      TestUtil.execute(conn, "INSERT INTO sphidden2.hidden_tbl VALUES ('from_2')");
+
+      // set_config() reports a SELECT command tag, so the driver does not detect the change from the
+      // command tag (on PostgreSQL 18+ it still learns of it from the GUC_REPORT).
+      execute("SELECT set_config('search_path', 'sphidden1', false)");
+      try (PreparedStatement ps = conn.prepareStatement("SELECT val FROM hidden_tbl")) {
+        for (int i = 0; i < 10; i++) {
+          ps.execute(); // warm up so the statement is prepared server-side and then reused
+        }
+        assertEquals("from_1", selectSingleValue(ps),
+            "search_path = sphidden1 must resolve hidden_tbl to sphidden1.hidden_tbl");
+
+        execute("SELECT set_config('search_path', 'sphidden2', false)");
+        assertEquals("from_2", selectSingleValue(ps),
+            "after the undetected search_path change the reused statement must resolve hidden_tbl "
+                + "to sphidden2.hidden_tbl");
+      }
+    } finally {
+      TestUtil.dropSchema(conn, "sphidden1");
+      TestUtil.dropSchema(conn, "sphidden2");
+    }
+  }
+
+  /**
+   * A {@code set search_path} hidden inside a PL/pgSQL routine reports a SELECT command tag, so the
+   * driver does not detect it from the command tag, yet a reused server-side prepared statement
+   * stays correct: on PostgreSQL 17 and older the backend re-plans the cached statement (since 9.3),
+   * and on 18+ the driver invalidates its cache from the GUC_REPORT. The test also checks whether the
+   * server reports search_path back to the client: PostgreSQL marks it as {@code GUC_REPORT} from
+   * version 18, so the value is visible through {@link PGConnection#getParameterStatus} on 18+ and
+   * absent on older servers.
+   *
+   * @see <a href="https://github.com/pgjdbc/pgjdbc/issues/3399">issue 3399</a>
+   */
+  @Test
+  void searchPathPreparedStatementInPlpgsqlStaysCorrect() throws SQLException {
+    assumeTrue(TestUtil.haveMinimumServerVersion(conn, ServerVersion.v9_3));
+    TestUtil.createSchema(conn, "splpgsql1");
+    TestUtil.createSchema(conn, "splpgsql2");
+    try {
+      TestUtil.createTable(conn, "splpgsql1.plpgsql_tbl", "val text");
+      TestUtil.createTable(conn, "splpgsql2.plpgsql_tbl", "val text");
+      TestUtil.execute(conn, "INSERT INTO splpgsql1.plpgsql_tbl VALUES ('from_1')");
+      TestUtil.execute(conn, "INSERT INTO splpgsql2.plpgsql_tbl VALUES ('from_2')");
+      // A PL/pgSQL routine that changes search_path. Calling it reports a SELECT command tag, so the
+      // driver does not detect the change from the command tag; it lives in a test schema and is
+      // dropped with it.
+      TestUtil.execute(conn,
+          "CREATE FUNCTION splpgsql1.set_search_path(p_schema text) RETURNS void AS $$ "
+              + "BEGIN PERFORM set_config('search_path', p_schema, false); END; $$ LANGUAGE plpgsql");
+
+      execute("SELECT splpgsql1.set_search_path('splpgsql1')");
+      try (PreparedStatement ps = conn.prepareStatement("SELECT val FROM plpgsql_tbl")) {
+        for (int i = 0; i < 10; i++) {
+          ps.execute(); // warm up so the statement is prepared server-side and then reused
+        }
+        assertEquals("from_1", selectSingleValue(ps),
+            "search_path = splpgsql1 must resolve plpgsql_tbl to splpgsql1.plpgsql_tbl");
+
+        execute("SELECT splpgsql1.set_search_path('splpgsql2')");
+        assertEquals("from_2", selectSingleValue(ps),
+            "after the PL/pgSQL search_path change the reused statement must resolve plpgsql_tbl "
+                + "to splpgsql2.plpgsql_tbl");
+
+        // search_path is GUC_REPORT from PostgreSQL 18 on, so the server reports the new value even
+        // when the change happened inside PL/pgSQL; older servers never report it.
+        String reported = conn.unwrap(PGConnection.class).getParameterStatus("search_path");
+        if (TestUtil.haveMinimumServerVersion(conn, ServerVersion.v18)) {
+          assertNotNull(reported,
+              "PostgreSQL 18+ marks search_path as GUC_REPORT, so the change must be reported");
+          assertTrue(reported.contains("splpgsql2"),
+              "the reported search_path must reflect the latest value, but was: " + reported);
+        } else {
+          assertNull(reported,
+              "before PostgreSQL 18 search_path is not GUC_REPORT, so the server does not report it");
+        }
+      }
+    } finally {
+      TestUtil.dropSchema(conn, "splpgsql1");
+      TestUtil.dropSchema(conn, "splpgsql2");
+    }
+  }
+
+  /**
+   * A {@code set search_path} hidden inside a PL/pgSQL routine changes which {@code sptest} the
+   * statement resolves to, and the two tables have different column types. The driver cannot see the
+   * change in the command tag, so on PostgreSQL 17 and older it keeps the cached statement and the
+   * reused plan's result type changes, which fails with {@code cached plan must not change result
+   * type}. PostgreSQL 18 reports the change (GUC_REPORT), so the driver invalidates its cache and the
+   * statement re-prepares cleanly against the new table.
+   *
+   * @see <a href="https://github.com/pgjdbc/pgjdbc/issues/3399">issue 3399</a>
+   */
+  @Test
+  void searchPathPreparedStatementInPlpgsqlInvalidatesOnGucReport() throws SQLException {
+    assumeTrue(TestUtil.haveMinimumServerVersion(conn, ServerVersion.v9_3));
+    // The version difference shows up only with server-side prepared statements -- the cached plan
+    // that goes stale -- which the simple query protocol does not use.
+    assumeTrue(conn.unwrap(PGConnection.class).getPreferQueryMode() != PreferQueryMode.SIMPLE,
+        "server-side prepared statements are not used in simple protocol");
+    // autosave (conservative/always) heals the cached-plan error by rolling back to a savepoint and
+    // retrying, which would hide the missed invalidation this test checks for.
+    assumeTrue(conn.unwrap(PGConnection.class).getAutosave() == AutoSave.NEVER,
+        "autosave would heal the cached-plan error");
+    // schema1.sptest is INT, schema2.sptest is VARCHAR, so the reused statement's result type
+    // changes across the schemas. The routine changes search_path from inside PL/pgSQL, which the
+    // driver cannot see in the command tag.
+    TestUtil.execute(conn, "CREATE FUNCTION schema1.set_search_path(p_schema text) RETURNS void AS $$"
+        + " BEGIN PERFORM set_config('search_path', p_schema, false); END; $$ LANGUAGE plpgsql");
+    try {
+      // autoCommit=false stops the reparse-on-error retry, so on PostgreSQL 17 and older the
+      // cached-plan error surfaces instead of being healed (autosave is required to be NEVER above).
+      conn.setAutoCommit(false);
+      execute("SELECT schema1.set_search_path('schema1')");
+      try (PreparedStatement ps = conn.prepareStatement("select * from sptest")) {
+        for (int i = 0; i < 10; i++) {
+          ps.execute(); // warm up so the statement is prepared server-side and then reused
+        }
+        assertColType(ps, "sptest resolves to schema1.sptest (INT) under search_path schema1",
+            Types.INTEGER);
+
+        // Hidden search_path change to schema2, where sptest is VARCHAR.
+        execute("SELECT schema1.set_search_path('schema2')");
+        if (TestUtil.haveMinimumServerVersion(conn, ServerVersion.v18)) {
+          // PostgreSQL 18+ reports the change, so the driver invalidates its cache and the reused
+          // statement re-prepares cleanly against schema2.sptest (VARCHAR).
+          assertColType(ps, "PostgreSQL 18+ invalidates the cache from the GUC_REPORT, so the reused "
+              + "statement re-prepares to schema2.sptest (VARCHAR)", Types.VARCHAR);
+        } else {
+          // Older servers do not report the change, so the driver keeps the cached statement; the
+          // backend re-plan then changes the result type and fails the statement.
+          PSQLException e = assertThrows(PSQLException.class, ps::executeQuery);
+          assertThat(e.getMessage(), containsString("cached plan must not change result type"));
+        }
+      }
+    } finally {
+      conn.setAutoCommit(true);
+      TestUtil.execute(conn, "DROP FUNCTION IF EXISTS schema1.set_search_path(text)");
+    }
+  }
+
+  private static String selectSingleValue(PreparedStatement ps) throws SQLException {
+    try (ResultSet rs = ps.executeQuery()) {
+      assertTrue(rs.next());
+      String value = rs.getString(1);
+      assertFalse(rs.next());
+      return value;
+    }
+  }
+
+  @Test
+  void currentSchemaPropertyVisibilityTableDuringFunctionCreation() throws SQLException {
+    Properties properties = new Properties();
+    properties.setProperty(PGProperty.CURRENT_SCHEMA.getName(), "public,schema1,schema2");
+    Connection connection = TestUtil.openDB(properties);
+
+    TestUtil.execute(connection, "create table schema1.check_table (test_col text)");
+    TestUtil.execute(connection, "insert into schema1.check_table (test_col) values ('test_value')");
+    TestUtil.execute(connection, "create or replace function schema2.check_fun () returns text as $$"
+        + " select test_col from check_table"
+        + "$$ language sql stable");
+    connection.close();
+  }
+
+  @Test
+  void currentSchemaPropertyNotVisibilityTableDuringFunctionCreation() throws SQLException {
+    Properties properties = new Properties();
+    properties.setProperty(PGProperty.CURRENT_SCHEMA.getName(), "public,schema2");
+
+    try (Connection connection = TestUtil.openDB(properties)) {
+      TestUtil.execute(connection, "create table schema1.check_table (test_col text)");
+      TestUtil.execute(connection, "insert into schema1.check_table (test_col) values ('test_value')");
+      TestUtil.execute(connection, "create or replace function schema2.check_fun (txt text) returns text as $$"
+          + " select test_col from check_table"
+          + "$$ language sql immutable");
+    } catch (PSQLException e) {
+      String sqlState = e.getSQLState();
+      String message = e.getMessage();
+      assertThat("Test creates function in schema 'schema2' and this function try use table \"check_table\" "
+            + "from schema 'schema1'. We expect here sql error code - "
+            + PSQLState.UNDEFINED_TABLE + ", because search_path does not contains schema 'schema1' and "
+            + "postgres does not see table \"check_table\"",
+            sqlState,
+            equalTo(PSQLState.UNDEFINED_TABLE.getState())
+      );
+      assertThat(
+          "Test creates function in schema 'schema2' and this function try use table \"check_table\" "
+              + "from schema 'schema1'. We expect here that sql error message will be contains \"check_table\", "
+              + "because search_path does not contains schema 'schema1' and postgres does not see "
+              + "table \"check_table\"",
+            message,
+            containsString("\"check_table\"")
+      );
+    }
+  }
+
+  @Test
+  void currentSchemaPropertyVisibilityFunction() throws SQLException {
+    currentSchemaPropertyVisibilityTableDuringFunctionCreation();
+    Properties properties = new Properties();
+    properties.setProperty(PGProperty.CURRENT_SCHEMA.getName(), "public,schema1,schema2");
+    Connection connection = TestUtil.openDB(properties);
+
+    TestUtil.execute(connection, "select check_fun()");
+    connection.close();
+  }
+
+  @Test
+  void currentSchemaPropertyNotVisibilityTableInsideFunction() throws SQLException {
+    currentSchemaPropertyVisibilityTableDuringFunctionCreation();
+    Properties properties = new Properties();
+    properties.setProperty(PGProperty.CURRENT_SCHEMA.getName(), "public,schema2");
+
+    try (Connection connection = TestUtil.openDB(properties)) {
+      TestUtil.execute(connection, "select check_fun()");
+    } catch (PSQLException e) {
+      String sqlState = e.getSQLState();
+      String message = e.getMessage();
+      assertThat("Test call function in schema 'schema2' and this function uses table \"check_table\" "
+            + "from schema 'schema1'. We expect here sql error code - " + PSQLState.UNDEFINED_TABLE + ", "
+            + "because search_path does not contains schema 'schema1' and postgres does not see table \"check_table\".",
+            sqlState,
+            equalTo(PSQLState.UNDEFINED_TABLE.getState())
+      );
+      assertThat(
+          "Test call function in schema 'schema2' and this function uses table \"check_table\" "
+              + "from schema 'schema1'. We expect here that sql error message will be contains \"check_table\", because "
+              + " search_path does not contains schema 'schema1' and postgres does not see table \"check_table\"",
+          message,
+          containsString("\"check_table\"")
+      );
+    }
+  }
+
+  private static void assertColType(PreparedStatement ps, String message, int expected) throws SQLException {
+    ResultSet rs = ps.executeQuery();
+    ResultSetMetaData md = rs.getMetaData();
+    int columnType = md.getColumnType(1);
+    assertEquals(expected, columnType, message);
+    rs.close();
+  }
+
+}

@@ -1,0 +1,110 @@
+/*
+ * Copyright (c) 2004, PostgreSQL Global Development Group
+ * See the LICENSE file in the project root for more information.
+ */
+
+package org.postgresql.test.jdbc2;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+import org.postgresql.test.TestUtil;
+
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+
+/*
+ * Tests for using non-zero setFetchSize().
+ */
+public class ServerCursorTest extends BaseTest4 {
+
+  @BeforeAll
+  static void createTables() throws Exception {
+    try (Connection con = TestUtil.openDB()) {
+      TestUtil.createTable(con, "test_fetch", "value integer,data bytea");
+    }
+  }
+
+  @AfterAll
+  static void dropTables() throws Exception {
+    try (Connection con = TestUtil.openDB()) {
+      TestUtil.dropTable(con, "test_fetch");
+    }
+  }
+
+  @Override
+  public void setUp() throws Exception {
+    super.setUp();
+    TestUtil.execute(con, "TRUNCATE test_fetch");
+    con.setAutoCommit(false);
+  }
+
+  @Override
+  public void tearDown() throws SQLException {
+    con.rollback();
+    con.setAutoCommit(true);
+    super.tearDown();
+  }
+
+  protected void createRows(int count) throws Exception {
+    PreparedStatement stmt = con.prepareStatement("insert into test_fetch(value,data) values(?,?)");
+    for (int i = 0; i < count; i++) {
+      stmt.setInt(1, i + 1);
+      stmt.setBytes(2, DATA_STRING.getBytes("UTF8"));
+      stmt.executeUpdate();
+    }
+    con.commit();
+  }
+
+  // Test regular cursor fetching
+  @Test
+  public void testBasicFetch() throws Exception {
+    createRows(1);
+
+    PreparedStatement stmt =
+        con.prepareStatement("declare test_cursor cursor for select * from test_fetch");
+    stmt.execute();
+
+    stmt = con.prepareStatement("fetch forward from test_cursor");
+    ResultSet rs = stmt.executeQuery();
+    while (rs.next()) {
+      // there should only be one row returned
+      assertEquals(1, rs.getInt(1), "query value error");
+      byte[] dataBytes = rs.getBytes(2);
+      assertEquals(DATA_STRING, new String(dataBytes, "UTF8"), "binary data got munged");
+    }
+  }
+
+  // Test binary cursor fetching
+  @Test
+  public void testBinaryFetch() throws Exception {
+    createRows(1);
+
+    PreparedStatement stmt =
+        con.prepareStatement("declare test_cursor binary cursor for select * from test_fetch");
+    stmt.execute();
+
+    stmt = con.prepareStatement("fetch forward from test_cursor");
+    ResultSet rs = stmt.executeQuery();
+    while (rs.next()) {
+      // there should only be one row returned
+      byte[] dataBytes = rs.getBytes(2);
+      assertEquals(DATA_STRING, new String(dataBytes, "UTF8"), "binary data got munged");
+    }
+  }
+
+  //CHECKSTYLE: OFF
+  // This string contains a variety different data:
+  // three japanese characters representing "japanese" in japanese
+  // the four characters "\000"
+  // a null character
+  // the seven ascii characters "english"
+  private static final String DATA_STRING = "\u65E5\u672C\u8A9E\\000\u0000english";
+  //CHECKSTYLE: ON
+
+}

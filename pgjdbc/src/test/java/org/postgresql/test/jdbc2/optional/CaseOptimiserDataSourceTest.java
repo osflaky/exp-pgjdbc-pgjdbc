@@ -1,0 +1,113 @@
+/*
+ * Copyright (c) 2004, PostgreSQL Global Development Group
+ * See the LICENSE file in the project root for more information.
+ */
+
+package org.postgresql.test.jdbc2.optional;
+
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+
+import org.postgresql.core.BaseConnection;
+import org.postgresql.ds.common.BaseDataSource;
+import org.postgresql.test.TestUtil;
+import org.postgresql.util.PSQLException;
+
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+
+/**
+ * DataSource test to ensure the BaseConnection is configured with column sanitiser disabled.
+ */
+public class CaseOptimiserDataSourceTest {
+  private BaseDataSource bds;
+  protected Connection conn;
+
+  @BeforeAll
+  static void createTables() throws Exception {
+    try (Connection conn = TestUtil.openDB()) {
+      TestUtil.createTable(conn, "allmixedup",
+          "id int primary key, \"DESCRIPTION\" varchar(40), \"fOo\" varchar(3)");
+    }
+  }
+
+  @AfterAll
+  static void dropTables() throws Exception {
+    try (Connection conn = TestUtil.openDB()) {
+      TestUtil.dropTable(conn, "allmixedup");
+    }
+  }
+
+  @BeforeEach
+  void setUp() throws SQLException {
+    try (Connection conn = getDataSourceConnection()) {
+      assertInstanceOf(BaseConnection.class, conn);
+      BaseConnection bc = (BaseConnection) conn;
+      assertTrue(bc.isColumnSanitiserDisabled(),
+          "Expected state [TRUE] of base connection configuration failed test.");
+      TestUtil.execute(conn, "TRUNCATE allmixedup CASCADE");
+      TestUtil.execute(conn, TestUtil.insertSQL("allmixedup", "1,'mixed case test', 'bar'"));
+    }
+  }
+
+  @AfterEach
+  void tearDown() throws SQLException {
+    bds.setDisableColumnSanitiser(false);
+  }
+
+  /*
+   * Test to ensure a datasource can be configured with the column sanitiser optimisation. This test
+   * checks for a side effect of the sanitiser being disabled. The column is not expected to be
+   * found.
+   */
+  @Test
+  void dataSourceDisabledSanitiserPropertySucceeds() throws SQLException {
+    String label = "FOO";
+    Connection conn = getDataSourceConnection();
+    PreparedStatement query =
+        conn.prepareStatement("select * from allmixedup");
+    if (0 < TestUtil.findColumn(query, label)) {
+      fail(String.format("Did not expect to find the column with the label [%1$s].", label));
+    }
+    query.close();
+    conn.close();
+  }
+
+  /**
+   * Gets a connection from the current BaseDataSource.
+   */
+  protected Connection getDataSourceConnection() throws SQLException {
+    if (bds == null) {
+      initializeDataSource();
+    }
+    return bds.getConnection();
+  }
+
+  @SuppressWarnings("deprecation")
+  protected void initializeDataSource() throws PSQLException {
+    if (bds == null) {
+      bds = new org.postgresql.jdbc2.optional.SimpleDataSource();
+      setupDataSource(bds);
+      bds.setDisableColumnSanitiser(true);
+    }
+  }
+
+  @SuppressWarnings("deprecation")
+  public static void setupDataSource(BaseDataSource bds) throws PSQLException {
+    bds.setServerName(TestUtil.getServer());
+    bds.setPortNumber(TestUtil.getPort());
+    bds.setDatabaseName(TestUtil.getDatabase());
+    bds.setUser(TestUtil.getUser());
+    bds.setPassword(TestUtil.getPassword());
+    bds.setPrepareThreshold(TestUtil.getPrepareThreshold());
+    bds.setProtocolVersion(TestUtil.getProtocolVersion());
+  }
+}

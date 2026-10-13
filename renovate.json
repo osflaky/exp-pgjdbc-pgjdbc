@@ -1,0 +1,101 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:best-practices"
+  ],
+  "labels": [
+    "dependencies"
+  ],
+  "schedule": [
+    "every 3 weeks on Monday"
+  ],
+  "vulnerabilityAlerts": {
+    "description": "Security updates bypass the packageRules grouping below (Renovate resets their groupName), so apply the same groupId grouping to them here.",
+    "groupName": "{{{replace ':.*' '' depName}}} security"
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Track the newest PostgreSQL major (MAX_PG in matrix.mjs) against the postgres Docker image. The regex versioning keeps only single-number major tags, so Renovate bumps MAX_PG when the next major image ships, not on minor `postgres:18.x` releases.",
+      "managerFilePatterns": [
+        "/\\.github/workflows/matrix\\.mjs$/"
+      ],
+      "matchStrings": [
+        "// renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+) versioning=(?<versioning>\\S+)\\s+const MAX_PG = '(?<currentValue>\\d+)'"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Group every Maven update by its groupId by default. The more specific rules below run later and override this where a group must span several groupIds, pin a version, or stay disabled.",
+      "matchDatasources": [
+        "maven"
+      ],
+      "groupName": "{{{replace ':.*' '' depName}}}"
+    },
+    {
+      "description": "The com.ongres SCRAM and stringprep libraries are shaded into the driver, so a minor or major update changes the driver's own code. Keep patch updates in a branch of their own: without separateMinorPatch, Renovate offers only the newest non-major version, and a pending minor update would hide every patch update.",
+      "matchPackageNames": [
+        "com.ongres.**"
+      ],
+      "separateMinorPatch": true
+    },
+    {
+      "description": "A minor or major com.ongres update waits for a pgjdbc minor release. Renovate lists it on the Dependency Dashboard and opens the pull request once its checkbox is ticked.",
+      "matchPackageNames": [
+        "com.ongres.**"
+      ],
+      "matchUpdateTypes": [
+        "major",
+        "minor"
+      ],
+      "dependencyDashboardApproval": true
+    },
+    {
+      "groupName": "checkerframework",
+      "matchPackageNames": [
+        "org.checkerframework{/,}**"
+      ],
+      "allowedVersions": "<4.0.0"
+    },
+    {
+      "groupName": "junit-bom",
+      "matchPackageNames": [
+        "org.junit:junit-bom"
+      ],
+      "allowedVersions": "<6.0.0"
+    },
+    {
+      "matchPackageNames": [
+        "org.postgresql:postgresql"
+      ],
+      "matchCurrentVersion": "1.0.0-dev-master-SNAPSHOT",
+      "enabled": false
+    },
+    {
+      "description": "MAX_PG is a plain major number, not a pinnable image reference, so skip the config:best-practices digest pin. Scoped to matrix.mjs so a real `FROM postgres` Dockerfile still gets a pinned digest.",
+      "matchFileNames": [
+        ".github/workflows/matrix.mjs"
+      ],
+      "matchDepNames": [
+        "postgres"
+      ],
+      "pinDigests": false
+    },
+    {
+      "matchPackageNames": [
+        "uk.org.webcompere:system-stubs-jupiter"
+      ],
+      "groupName": "system-stubs-jupiter",
+      "matchCurrentVersion": "< 2.0",
+      "enabled": false
+    },
+    {
+      "matchPackageNames": [
+        "uk.org.webcompere:system-stubs-jupiter"
+      ],
+      "groupName": "system-stubs-jupiter",
+      "matchCurrentVersion": "> 2.0"
+    }
+  ]
+}

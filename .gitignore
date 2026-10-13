@@ -1,0 +1,41 @@
+.classpath
+.gradle
+.settings
+.project
+.checkstyle
+.DS_Store
+node_modules
+.externalToolBuilders
+build
+jars
+.*.swp
+nbproject
+.idea
+*.iml
+*.ipr
+*.iws
+*.local.properties
+*-dist.zip
+*.po.~*~
+target/
+/build/
+/*/build/
+/out/
+/*/out/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+
+# Ignore local scratch files
+/scratch
+
+# Ignore folders used to build binaries for old Java
+/eclipsebin/
+
+# Scratch folder used by the codex-review skill
+# https://github.com/Netcracker/qubership-ai-packages/tree/main/agent-packages/codex-review
+.codex-review

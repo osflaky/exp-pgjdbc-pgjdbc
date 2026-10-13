@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Build the PostgreSQL devel image from apt.postgresql.org's *-pgdg-snapshot
+# suite and start it via the shared postgres-server compose.
+#
+#    PG_MAJOR = 19 | 18 | ...                - PostgreSQL major to install
+#                                              (unset => the build picks the
+#                                              highest available in pgdg-snapshot)
+#    PG_IMAGE = image tag to build and run   - defaults to pgjdbc/postgres-devel:local
+
+log () {
+    echo "$@" 1>&2
+}
+
+main () {
+    local image="${PG_IMAGE:-pgjdbc/postgres-devel:local}"
+    local script_dir
+    script_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+
+    log "Building ${image} (PG_MAJOR=${PG_MAJOR:-auto from pgdg-snapshot})"
+    docker build \
+        --build-arg "PG_MAJOR=${PG_MAJOR:-}" \
+        --tag "${image}" \
+        "${script_dir}/../postgres-head"
+
+    log "Starting the devel server through the shared postgres-server compose"
+    PG_IMAGE="${image}" exec "${script_dir}/postgres-server"
+}
+
+main "$@"

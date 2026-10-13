@@ -1,0 +1,52 @@
+services:
+  pgdb:
+    image: ${PG_IMAGE:-postgres:${PGV:-latest}}
+    # With the default pull_policy (missing) this section is ignored and the
+    # official postgres:<PGV> is pulled; force a build with PG_PULL_POLICY=build.
+    build:
+      context: ../postgres-head
+      args:
+        PG_MAJOR: ${PG_MAJOR:-}
+    pull_policy: ${PG_PULL_POLICY:-missing}
+    ports:
+      - 5432:5432
+      - 5433:5433
+      - 5434:5434
+    security_opt:
+      - seccomp:unconfined
+    volumes:
+      - ./scripts/:/custom/scripts:ro
+      - ../../certdir/server:/custom/certdir:ro
+    entrypoint:
+      - bash
+      - /custom/scripts/entrypoint.sh
+    environment:
+      - SSL=${SSL:-yes}
+      - XA=${XA:-yes}
+      - SCRAM=${SCRAM:-yes}
+      - TZ=${TZ:-Etc/UTC}
+      - FSYNC=${FSYNC:-no}
+      - SYNC_COMMIT=${SYNC_COMMIT:-yes}
+      - FULL_PAGE_WRITES=${FULL_PAGE_WRITES:-no}
+      - AUTO_VACUUM=${AUTO_VACUUM:-no}
+      - TRACK_COUNTS=${TRACK_COUNTS:-no}
+      - CREATE_REPLICAS=${CREATE_REPLICAS:-no}
+      - STANDARD_CONFORMING_STRINGS=${STANDARD_CONFORMING_STRINGS:-yes}
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=
+      - POSTGRES_DB=postgres
+      - POSTGRES_HOST_AUTH_METHOD=trust
+      - GITHUB_ACTIONS=true
+    command: >-
+      postgres
+    healthcheck:
+      # Probe the TCP listener with bash, not the socket: the entrypoint runs a
+      # socket-only temp server while initialising, so the listener is reachable
+      # only once the real server is up. This is version-, auth- and SSL-agnostic,
+      # unlike pg_isready (the Debian pg_wrapper cannot resolve it for servers
+      # older than 9.3). It lets consumers `docker compose up --wait`.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/5432'"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
